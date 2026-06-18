@@ -170,7 +170,7 @@ func NewRecommenderController(
 			}
 			externalSource := input_metrics.NewPrometheusClient(promAPI, clusterState, prometheusClientOptions)
 			klog.V(1).InfoS("Using Metrics Server with per-VPA Prometheus overrides")
-			source = input_metrics.NewMultiSource(defaultSource, externalSource)
+			source = input_metrics.NewMultiSource(defaultSource, externalSource, clusterState)
 		}
 	}
 
