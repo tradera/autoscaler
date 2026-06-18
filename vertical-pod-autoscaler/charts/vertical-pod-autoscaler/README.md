@@ -2,11 +2,14 @@
 
 WARNING: This chart is currently under development and is not ready for production use.
 
-Automatically adjust resources for your workloads
+Automatically adjust resources for your workloads. Tradera fork: adds
+per-VPA opt-in for external metrics, Prometheus-backed OOM observation,
+and per-VPA history backfill via annotations under
+external.vpa.k8s.io/. See the chart README for details.
 
-![Version: 0.9.0](https://img.shields.io/badge/Version-0.9.0-informational?style=flat-square)
+![Version: 0.9.0-tradera.0](https://img.shields.io/badge/Version-0.9.0--tradera.0-informational?style=flat-square)
 ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
-![AppVersion: 1.6.0](https://img.shields.io/badge/AppVersion-1.6.0-informational?style=flat-square)
+![AppVersion: 1.6.0-tradera.0](https://img.shields.io/badge/AppVersion-1.6.0--tradera.0-informational?style=flat-square)
 
 ## Introduction
 The Vertical Pod Autoscaler (VPA) automatically adjusts the CPU and memory resource requests of pods to match their actual resource utilization.
@@ -22,8 +25,7 @@ helm upgrade -i vertical-pod-autoscaler autoscalers/vertical-pod-autoscaler
 
 | Name | Email | Url |
 | ---- | ------ | --- |
-| adrianmoisey | <kubernetes-sig-autoscaling@googlegroups.com> |  |
-| omerap12 | <kubernetes-sig-autoscaling@googlegroups.com> |  |
+| tradera |  | <https://github.com/tradera> |
 
 ## Webhook Management
 The admission controller requires a `MutatingWebhookConfiguration` and TLS certificates. This chart supports two mutually exclusive modes:
@@ -112,7 +114,7 @@ helm upgrade <release-name> <chart> \
 | admissionController.extraEnv | list | `[]` |  |
 | admissionController.hostNetwork | bool | `false` | Enable host network for the admission controller pod. Set to true when the pod needs direct access to the host's network namespace. Note: this bypasses Kubernetes network isolation and may cause port conflicts if multiple replicas run on the same node. |
 | admissionController.image.pullPolicy | string | `"IfNotPresent"` |  |
-| admissionController.image.repository | string | `"registry.k8s.io/autoscaling/vpa-admission-controller"` |  |
+| admissionController.image.repository | string | `"ghcr.io/tradera/autoscaler/vpa-admission-controller"` |  |
 | admissionController.image.tag | string | `nil` |  |
 | admissionController.mutatingWebhookConfiguration.annotations | object | `{}` | Additional annotations for the MutatingWebhookConfiguration |
 | admissionController.mutatingWebhookConfiguration.failurePolicy | string | `"Ignore"` | The failurePolicy for the mutating webhook. Allowed values are: Ignore, Fail |
@@ -175,7 +177,7 @@ helm upgrade <release-name> <chart> \
 | recommender.extraArgs | list | `[]` |  |
 | recommender.extraEnv | list | `[]` |  |
 | recommender.image.pullPolicy | string | `"IfNotPresent"` |  |
-| recommender.image.repository | string | `"registry.k8s.io/autoscaling/vpa-recommender"` |  |
+| recommender.image.repository | string | `"ghcr.io/tradera/autoscaler/vpa-recommender"` |  |
 | recommender.image.tag | string | `nil` |  |
 | recommender.leaderElection.enabled | string | `nil` |  |
 | recommender.leaderElection.leaseDuration | string | `"15s"` |  |
@@ -206,7 +208,7 @@ helm upgrade <release-name> <chart> \
 | updater.enabled | bool | `true` |  |
 | updater.extraArgs | list | `[]` |  |
 | updater.image.pullPolicy | string | `"IfNotPresent"` |  |
-| updater.image.repository | string | `"registry.k8s.io/autoscaling/vpa-updater"` |  |
+| updater.image.repository | string | `"ghcr.io/tradera/autoscaler/vpa-updater"` |  |
 | updater.image.tag | string | `nil` |  |
 | updater.leaderElection.enabled | string | `nil` |  |
 | updater.leaderElection.leaseDuration | string | `"15s"` |  |

@@ -91,6 +91,9 @@ type RecommenderConfig struct {
 	ExternalCpuMetric    string
 	ExternalMemoryMetric string
 
+	// Per-VPA Prometheus OOM observer configuration
+	PrometheusOOMObserverInterval time.Duration
+
 	// Aggregation configuration
 	MemoryAggregationInterval      time.Duration
 	MemoryAggregationIntervalCount int64
@@ -162,6 +165,9 @@ func DefaultRecommenderConfig() *RecommenderConfig {
 		UseExternalMetrics:   false,
 		ExternalCpuMetric:    "",
 		ExternalMemoryMetric: "",
+
+		// Per-VPA Prometheus OOM observer flags
+		PrometheusOOMObserverInterval: 15 * time.Second,
 
 		// Aggregation configuration flags
 		MemoryAggregationInterval:      model.DefaultMemoryAggregationInterval,
@@ -235,6 +241,9 @@ func InitRecommenderFlags() *RecommenderConfig {
 	flag.BoolVar(&config.UseExternalMetrics, "use-external-metrics", config.UseExternalMetrics, "ALPHA.  Use an external metrics provider instead of metrics_server.")
 	flag.StringVar(&config.ExternalCpuMetric, "external-metrics-cpu-metric", config.ExternalCpuMetric, "ALPHA.  Metric to use with external metrics provider for CPU usage.")
 	flag.StringVar(&config.ExternalMemoryMetric, "external-metrics-memory-metric", config.ExternalMemoryMetric, "ALPHA.  Metric to use with external metrics provider for memory usage.")
+
+	// Per-VPA Prometheus OOM observer flags
+	flag.DurationVar(&config.PrometheusOOMObserverInterval, "prometheus-oom-observer-interval", config.PrometheusOOMObserverInterval, `How often the Prometheus OOM observer polls counters annotated on VPAs (external.vpa.k8s.io/oom-counter-metric). Deltas are computed in-process against the previous poll's absolute counter value, so this flag controls reaction latency only — not event-count fidelity. Default 15s.`)
 
 	// Aggregation configuration flags
 	flag.DurationVar(&config.MemoryAggregationInterval, "memory-aggregation-interval", config.MemoryAggregationInterval, `The length of a single interval, for which the peak memory usage is computed. Memory usage peaks are aggregated in multiples of this interval. In other words there is one memory usage sample per interval (the maximum usage over that interval)`)

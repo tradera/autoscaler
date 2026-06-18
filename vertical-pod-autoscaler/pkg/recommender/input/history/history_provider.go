@@ -134,23 +134,26 @@ type prometheusHistoryProvider struct {
 	historyResolution prommodel.Duration
 }
 
-// NewPrometheusHistoryProvider constructs a history provider that gets data from Prometheus.
-func NewPrometheusHistoryProvider(config PrometheusHistoryProviderConfig) (HistoryProvider, error) {
+// NewPrometheusAPI builds a Prometheus v1 API client from the given address,
+// TLS insecure flag, and credentials. The returned client wraps the standard
+// VPA recommender Prometheus instrumentation, so its requests show up in the
+// same metrics as those issued by the history provider.
+func NewPrometheusAPI(address string, insecure bool, auth PrometheusCredentials) (prometheusv1.API, error) {
 	prometheusTransport := promapi.DefaultRoundTripper
 
-	if config.Insecure {
+	if insecure {
 		prometheusTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
 
-	if config.Authentication.BearerToken != "" {
+	if auth.BearerToken != "" {
 		prometheusTransport = &PrometheusBearerTokenAuthTransport{
-			Token: config.Authentication.BearerToken,
+			Token: auth.BearerToken,
 			Base:  prometheusTransport,
 		}
-	} else if config.Authentication.Username != "" && config.Authentication.Password != "" {
+	} else if auth.Username != "" && auth.Password != "" {
 		prometheusTransport = &PrometheusBasicAuthTransport{
-			Username: config.Authentication.Username,
-			Password: config.Authentication.Password,
+			Username: auth.Username,
+			Password: auth.Password,
 			Base:     prometheusTransport,
 		}
 	} else {
@@ -170,12 +173,19 @@ func NewPrometheusHistoryProvider(config PrometheusHistoryProviderConfig) (Histo
 		metrics_recommender.NewPrometheusRoundTripperDuration(prometheusTransport),
 	)
 
-	promConfig := promapi.Config{
-		Address:      config.Address,
+	promClient, err := promapi.NewClient(promapi.Config{
+		Address:      address,
 		RoundTripper: roundTripper,
+	})
+	if err != nil {
+		return nil, err
 	}
+	return prometheusv1.NewAPI(promClient), nil
+}
 
-	promClient, err := promapi.NewClient(promConfig)
+// NewPrometheusHistoryProvider constructs a history provider that gets data from Prometheus.
+func NewPrometheusHistoryProvider(config PrometheusHistoryProviderConfig) (HistoryProvider, error) {
+	api, err := NewPrometheusAPI(config.Address, config.Insecure, config.Authentication)
 	if err != nil {
 		return &prometheusHistoryProvider{}, err
 	}
@@ -192,7 +202,7 @@ func NewPrometheusHistoryProvider(config PrometheusHistoryProviderConfig) (Histo
 	}
 
 	return &prometheusHistoryProvider{
-		prometheusClient:  prometheusv1.NewAPI(promClient),
+		prometheusClient:  api,
 		config:            config,
 		queryTimeout:      config.QueryTimeout,
 		historyDuration:   historyDuration,

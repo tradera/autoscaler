@@ -1,3 +1,15 @@
+# NOTE (Tradera fork): this chart ships images built from the
+# tradera/autoscaler fork, published to ghcr.io/tradera/autoscaler/vpa-*.
+# In addition to upstream behavior, the recommender supports per-VPA
+# annotations under `external.vpa.k8s.io/` for opting individual VPAs into:
+#   * external metrics (cpu-metric, memory-metric)
+#   * runtime-internal OOM detection from a Prometheus counter
+#     (oom-counter-metric, polled at --prometheus-oom-observer-interval)
+#   * cold-start history backfill (history-query-cpu, history-query-memory)
+# The values for these annotations are Prometheus instant vector selectors,
+# e.g. `dotnet_oome{deployment="api"}`. See the PR description on
+# tradera/autoscaler#1 for the full surface.
+
 # Image pull secrets.
 imagePullSecrets: []
 
@@ -30,7 +42,7 @@ admissionController:
 
   image:
     # Image repository for the Admission Controller default container.
-    repository: registry.k8s.io/autoscaling/vpa-admission-controller
+    repository: ghcr.io/tradera/autoscaler/vpa-admission-controller
     # Image tag for the Admission Controller default container; this will default to `.Chart.AppVersion` if not set
     tag:
     # Image pull policy for the Admission Controller default container.
@@ -198,7 +210,7 @@ recommender:
 
   image:
     # Image repository for the Recommender default container.
-    repository: registry.k8s.io/autoscaling/vpa-recommender
+    repository: ghcr.io/tradera/autoscaler/vpa-recommender
     # Image tag for the Recommender default container; this will default to `.Chart.AppVersion` if not set
     tag:
     # Image pull policy for the Recommender default container.
@@ -301,7 +313,7 @@ updater:
 
   image:
     # Image repository for the Updater default container.
-    repository: registry.k8s.io/autoscaling/vpa-updater
+    repository: ghcr.io/tradera/autoscaler/vpa-updater
     # Image tag for the Updater default container; this will default to `.Chart.AppVersion` if not set
     tag:
     # Image pull policy for the Updater default container.

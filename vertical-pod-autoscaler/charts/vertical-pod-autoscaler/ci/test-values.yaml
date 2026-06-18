@@ -1,0 +1,18 @@
+# Overrides used by chart-testing (`ct install`) in the upstream
+# "Lint and Test Charts" workflow. The chart defaults at
+# ghcr.io/tradera/autoscaler/vpa-* are private, so kind cannot pull
+# them anonymously and the install would fail with ImagePullBackOff.
+# Point at the upstream public VPA images instead so the install test
+# exercises chart structure and templating.
+recommender:
+  image:
+    repository: registry.k8s.io/autoscaling/vpa-recommender
+    tag: "1.6.0"
+updater:
+  image:
+    repository: registry.k8s.io/autoscaling/vpa-updater
+    tag: "1.6.0"
+admissionController:
+  image:
+    repository: registry.k8s.io/autoscaling/vpa-admission-controller
+    tag: "1.6.0"

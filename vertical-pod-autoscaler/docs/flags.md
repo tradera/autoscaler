@@ -122,6 +122,7 @@ This document is auto-generated from the flag definitions in the VPA recommender
 | `prometheus-bearer-token-file` | string |  | Path to the bearer token file used for authentication by the Prometheus server |
 | `prometheus-cadvisor-job-name` | string |  "kubernetes-cadvisor" | Name of the prometheus job name which scrapes the cAdvisor metrics  |
 | `prometheus-insecure` |  |  | Skip tls verify if https is used in the prometheus-address |
+| `prometheus-oom-observer-interval` |  |  15s | duration              How often the Prometheus OOM observer polls counters annotated on VPAs (external.vpa.k8s.io/oom-counter-metric). Deltas are computed in-process against the previous poll's absolute counter value, so this flag controls reaction latency only — not event-count fidelity. Default 15s.  |
 | `prometheus-query-timeout` | string |  "5m" | How long to wait before killing long queries  |
 | `recommendation-lower-bound-cpu-percentile` | float |  0.5 | CPU usage percentile that will be used for the lower bound on CPU recommendation.  |
 | `recommendation-lower-bound-memory-percentile` | float |  0.5 | Memory usage percentile that will be used for the lower bound on memory recommendation.  |

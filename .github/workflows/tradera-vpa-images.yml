@@ -1,0 +1,62 @@
+name: Tradera VPA images
+
+on:
+  push:
+    branches: ["tradera/**", "feat/**"]
+    tags: ["vpa-tradera-v*"]
+    paths:
+      - "vertical-pod-autoscaler/**"
+      - ".github/workflows/tradera-vpa-images.yml"
+      - ".github/workflows/tradera-vpa-chart.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Additional image tag to apply"
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [recommender, updater, admission-controller]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/vpa-${{ matrix.component }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=tag
+            type=match,pattern=vpa-tradera-v(.+),group=1
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: vertical-pod-autoscaler
+          file: vertical-pod-autoscaler/pkg/${{ matrix.component }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,scope=${{ matrix.component }},mode=max
+          provenance: false

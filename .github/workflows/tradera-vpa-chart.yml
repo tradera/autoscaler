@@ -1,0 +1,97 @@
+name: Tradera VPA chart
+
+on:
+  push:
+    branches: ["tradera/**", "feat/**"]
+    tags: ["vpa-tradera-v*"]
+    paths:
+      # Mirror tradera-vpa-images.yml's paths so the two workflows co-fire
+      # on the same commits. The chart's appVersion is a 7-char sha that
+      # must resolve to an image tag the images workflow published for
+      # the same commit; firing them together keeps that mapping intact.
+      - "vertical-pod-autoscaler/**"
+      - ".github/workflows/tradera-vpa-chart.yml"
+      - ".github/workflows/tradera-vpa-images.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Chart and app version to publish (without leading v). Required."
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            APPVERSION="vpa-tradera-v$VERSION"
+          elif [[ "$GITHUB_REF" == refs/tags/vpa-tradera-v* ]]; then
+            # tag refs/tags/vpa-tradera-v0.9.0  →  0.9.0
+            VERSION="${GITHUB_REF_NAME#vpa-tradera-v}"
+            # Tag image is published with the full git tag; pin appVersion
+            # to that so `helm install` resolves images without an explicit
+            # image.tag override.
+            APPVERSION="vpa-tradera-v$VERSION"
+          else
+            # Branch push (tradera/** or feat/**): synthesize a pre-release
+            # chart pinned to the image built for this commit. The Tradera
+            # VPA images workflow tags pushes with the 7-char short sha.
+            SHA7="${GITHUB_SHA:0:7}"
+            BRANCH_SLUG="${GITHUB_REF_NAME//\//-}"
+            VERSION="0.0.0-${BRANCH_SLUG}.${SHA7}"
+            APPVERSION="$SHA7"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "version is empty" >&2; exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "appVersion=$APPVERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Lint
+        run: helm lint vertical-pod-autoscaler/charts/vertical-pod-autoscaler
+
+      - name: Package
+        run: |
+          helm package vertical-pod-autoscaler/charts/vertical-pod-autoscaler \
+            --version "${{ steps.ver.outputs.version }}" \
+            --app-version "${{ steps.ver.outputs.appVersion }}" \
+            --destination .
+
+      - name: Resolve OCI repo path
+        id: oci
+        run: |
+          # OCI repository references must be lowercase; github.repository
+          # may contain uppercase characters on personal forks.
+          REPO="${{ github.repository }}"
+          echo "repo=${REPO,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        run: |
+          helm push "vertical-pod-autoscaler-${{ steps.ver.outputs.version }}.tgz" \
+            "oci://ghcr.io/${{ steps.oci.outputs.repo }}/charts"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Chart published"
+            echo
+            echo "    helm install my-vpa oci://ghcr.io/${{ steps.oci.outputs.repo }}/charts/vertical-pod-autoscaler --version ${{ steps.ver.outputs.version }}"
+            echo
+            echo "Resolves to images tagged \`${{ steps.ver.outputs.appVersion }}\` (override per-component with \`--set <component>.image.tag=...\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
