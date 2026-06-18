@@ -31,7 +31,7 @@ import (
 // it.
 type multiSourceClusterState interface {
 	VPAs() map[model.VpaID]*model.Vpa
-	GetMatchingPods(vpa *model.Vpa) []model.PodID
+	GetMatchingPodsForVPAs(vpas []*model.Vpa) map[model.PodID]bool
 }
 
 // multiSource composes a default PodMetricsLister (typically metrics-server)
@@ -97,17 +97,24 @@ func (s *multiSource) List(ctx context.Context, namespace string, opts metav1.Li
 // match a VPA carrying external-metric annotations. Restricted to namespace
 // when it is non-empty, mirroring the List filter.
 func (s *multiSource) annotatedVPAPods(namespace string) map[string]struct{} {
-	excluded := make(map[string]struct{})
+	var annotated []*model.Vpa
 	for _, vpa := range s.clusterState.VPAs() {
 		if namespace != "" && vpa.ID.Namespace != namespace {
 			continue
 		}
-		if !annotations.HasExternalMetricOverride(vpa.Annotations) {
-			continue
+		if annotations.HasExternalMetricOverride(vpa.Annotations) {
+			annotated = append(annotated, vpa)
 		}
-		for _, podID := range s.clusterState.GetMatchingPods(vpa) {
-			excluded[podID.Namespace+"/"+podID.PodName] = struct{}{}
-		}
+	}
+	excluded := make(map[string]struct{})
+	if len(annotated) == 0 {
+		return excluded
+	}
+	// One pass over the pod set for all annotated VPAs. List runs ~once per
+	// recommender interval; GetMatchingPodsForVPAs collapses what would be a
+	// full pod scan per annotated VPA into a single traversal.
+	for podID := range s.clusterState.GetMatchingPodsForVPAs(annotated) {
+		excluded[podID.Namespace+"/"+podID.PodName] = struct{}{}
 	}
 	return excluded
 }

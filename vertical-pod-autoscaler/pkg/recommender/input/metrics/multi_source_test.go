@@ -50,8 +50,14 @@ type stubClusterState struct {
 }
 
 func (s stubClusterState) VPAs() map[model.VpaID]*model.Vpa { return s.vpas }
-func (s stubClusterState) GetMatchingPods(vpa *model.Vpa) []model.PodID {
-	return s.matched[vpa.ID]
+func (s stubClusterState) GetMatchingPodsForVPAs(vpas []*model.Vpa) map[model.PodID]bool {
+	out := make(map[model.PodID]bool)
+	for _, vpa := range vpas {
+		for _, p := range s.matched[vpa.ID] {
+			out[p] = true
+		}
+	}
+	return out
 }
 
 // annotatedVPACluster builds a stubClusterState with a single VPA in ns that

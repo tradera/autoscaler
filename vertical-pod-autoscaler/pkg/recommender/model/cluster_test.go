@@ -940,3 +940,25 @@ func TestVPAWithMatchingPods(t *testing.T) {
 		})
 	}
 }
+
+func TestGetMatchingPodsForVPAs(t *testing.T) {
+	cluster := NewClusterState(testGcPeriod)
+	pod := addTestPod(cluster) // testPodID with testLabels {label-1: value-1}
+
+	matching := addTestVpa(cluster) // selector "label-1 = value-1" -> matches
+	nonMatching := addVpa(cluster, VpaID{Namespace: "namespace-1", VpaName: "vpa-2"},
+		testAnnotations, "label-1 = other", testTargetRef)
+
+	got := cluster.GetMatchingPodsForVPAs([]*Vpa{matching, nonMatching})
+	assert.True(t, got[pod.ID], "the matching VPA's pod is returned")
+	assert.Len(t, got, 1, "the non-matching VPA contributes nothing")
+
+	// Two VPAs matching the same pod are deduped into one entry (single pass).
+	matching2 := addVpa(cluster, VpaID{Namespace: "namespace-1", VpaName: "vpa-3"},
+		testAnnotations, testSelectorStr, testTargetRef)
+	got = cluster.GetMatchingPodsForVPAs([]*Vpa{matching, matching2})
+	assert.Len(t, got, 1)
+	assert.True(t, got[pod.ID])
+
+	assert.Empty(t, cluster.GetMatchingPodsForVPAs(nil))
+}

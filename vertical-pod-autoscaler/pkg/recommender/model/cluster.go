@@ -56,6 +56,7 @@ type ClusterState interface {
 	RateLimitedGarbageCollectAggregateCollectionStates(ctx context.Context, now time.Time, controllerFetcher controllerfetcher.ControllerFetcher)
 	RecordRecommendation(vpa *Vpa, now time.Time) error
 	GetMatchingPods(vpa *Vpa) []PodID
+	GetMatchingPodsForVPAs(vpas []*Vpa) map[PodID]bool
 	GetControllerForPodUnderVPA(ctx context.Context, pod *PodState, controllerFetcher controllerfetcher.ControllerFetcher) *controllerfetcher.ControllerKeyWithAPIVersion
 	GetControllingVPA(pod *PodState) *Vpa
 	VPAs() map[VpaID]*Vpa
@@ -504,6 +505,24 @@ func (cluster *clusterState) GetMatchingPods(vpa *Vpa) []PodID {
 		}
 	}
 	return matchingPods
+}
+
+// GetMatchingPodsForVPAs returns the set of currently active pods that match
+// any of the given VPAs, in a single pass over the pod set. Prefer this over
+// calling GetMatchingPods once per VPA when several VPAs are queried together:
+// GetMatchingPods traverses every pod, so N calls is N full scans.
+func (cluster *clusterState) GetMatchingPodsForVPAs(vpas []*Vpa) map[PodID]bool {
+	matching := make(map[PodID]bool)
+	for podID, pod := range cluster.pods {
+		podLabels := cluster.labelSetMap[pod.labelSetKey]
+		for _, vpa := range vpas {
+			if vpa_utils.PodLabelsMatchVPA(podID.Namespace, podLabels, vpa.ID.Namespace, vpa.PodSelector) {
+				matching[podID] = true
+				break
+			}
+		}
+	}
+	return matching
 }
 
 // GetControllerForPodUnderVPA returns controller associated with given Pod. Returns nil if Pod is not controlled by a VPA object.
