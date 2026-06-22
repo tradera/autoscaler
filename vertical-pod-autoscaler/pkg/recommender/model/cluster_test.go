@@ -343,9 +343,15 @@ func TestClusterRecordOOMFromPodState(t *testing.T) {
 		cluster := NewClusterState(testGcPeriod)
 		cluster.AddOrUpdatePod(testPodID, testLabels, corev1.PodRunning)
 		assert.NoError(t, cluster.AddOrUpdateContainer(testContainerID, testRequest))
-		// Emulate a checkpoint whose newest folded sample is at t=200; an OOM at
-		// t=150 is already represented and must not be re-counted on boot.
-		cluster.findOrCreateAggregateContainerState(testContainerID).LastSampleStart = time.Unix(200, 0)
+		// Boundary must come from the checkpoint the way production loads it:
+		// into the controlling VPA's ContainersInitialAggregateState, NOT the
+		// live aggregate (which is empty at boot). Emulate a checkpoint whose
+		// newest folded sample is at t=200; an OOM at t=150 is already
+		// represented and must not be re-counted on boot.
+		vpa := addTestVpa(cluster)
+		initial := NewAggregateContainerState()
+		initial.LastSampleStart = time.Unix(200, 0)
+		vpa.ContainersInitialAggregateState[testContainerID.ContainerName] = initial
 
 		recorded, err := cluster.RecordOOMFromPodState(testContainerID, time.Unix(150, 0), ResourceAmount(10))
 		assert.NoError(t, err)

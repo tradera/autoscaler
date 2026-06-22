@@ -285,12 +285,18 @@ func (cluster *clusterState) RecordOOM(containerID ContainerID, timestamp time.T
 // Because LastTerminationState is sticky (it keeps reporting the same OOMKill
 // until the next termination), re-reading it on every boot must not inflate the
 // recommendation. The OOM is recorded only if it post-dates the last sample
-// already folded into the aggregate that was loaded from the checkpoint
-// (LastSampleStart) — a checkpointed OOM always has LastSampleStart >= its
-// timestamp, so it is skipped. This makes the reconcile loop-safe (it can never
-// re-count an OOM that is already represented) at the cost of occasionally
-// skipping a just-missed OOM, which is the safe direction. Returns whether the
-// OOM was recorded.
+// already represented for the container in the checkpoint that was loaded into
+// the controlling VPA (ContainersInitialAggregateState.LastSampleStart) — a
+// checkpointed OOM has LastSampleStart >= its timestamp, so it is skipped. The
+// checkpoint-loaded state is deliberately NOT the live aggregate from
+// findOrCreateAggregateContainerState: that map starts empty on boot and is not
+// fed by checkpoints (the recommender merges ContainersInitialAggregateState
+// separately at recommendation time), so reading it would leave LastSampleStart
+// zero and the guard would never fire — re-recording every sticky OOM on every
+// restart and inflating the recommendation. This boundary makes the reconcile
+// loop-safe (it can never re-count an OOM already in the checkpoint) at the cost
+// of occasionally skipping a just-missed OOM, which is the safe direction.
+// Returns whether the OOM was recorded.
 func (cluster *clusterState) RecordOOMFromPodState(containerID ContainerID, timestamp time.Time, requestedMemory ResourceAmount) (bool, error) {
 	pod, podExists := cluster.pods[containerID.PodID]
 	if !podExists {
@@ -299,15 +305,30 @@ func (cluster *clusterState) RecordOOMFromPodState(containerID ContainerID, time
 	if _, containerExists := pod.Containers[containerID.ContainerName]; !containerExists {
 		return false, NewKeyError(containerID.ContainerName)
 	}
-	aggregate := cluster.findOrCreateAggregateContainerState(containerID)
-	if !timestamp.After(aggregate.LastSampleStart) {
-		// Already represented in the checkpoint-loaded aggregate.
+	if !timestamp.After(cluster.checkpointLastSampleStart(pod, containerID.ContainerName)) {
+		// Already represented in the checkpoint loaded for this container.
 		return false, nil
 	}
 	if err := cluster.RecordOOM(containerID, timestamp, requestedMemory); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// checkpointLastSampleStart returns the LastSampleStart of the checkpoint-loaded
+// aggregate for the container under its controlling VPA, used as the
+// boot-reconcile dedup boundary. Returns the zero time when the container has no
+// controlling VPA or no loaded checkpoint (so a never-checkpointed OOM is
+// recorded). See RecordOOMFromPodState for why the live aggregate is not used.
+func (cluster *clusterState) checkpointLastSampleStart(pod *PodState, containerName string) time.Time {
+	vpa := cluster.GetControllingVPA(pod)
+	if vpa == nil {
+		return time.Time{}
+	}
+	if initial, ok := vpa.ContainersInitialAggregateState[containerName]; ok && initial != nil {
+		return initial.LastSampleStart
+	}
+	return time.Time{}
 }
 
 // AddOrUpdateVpa adds a new VPA with a given ID to the clusterState if it
