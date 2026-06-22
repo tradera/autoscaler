@@ -327,6 +327,46 @@ func TestClusterRecordOOM(t *testing.T) {
 	assert.NotEmpty(t, aggregation.AggregateMemoryPeaks)
 }
 
+func TestClusterRecordOOMFromPodState(t *testing.T) {
+	t.Run("records an OOM newer than the last folded sample", func(t *testing.T) {
+		cluster := NewClusterState(testGcPeriod)
+		cluster.AddOrUpdatePod(testPodID, testLabels, corev1.PodRunning)
+		assert.NoError(t, cluster.AddOrUpdateContainer(testContainerID, testRequest))
+
+		recorded, err := cluster.RecordOOMFromPodState(testContainerID, time.Unix(100, 0), ResourceAmount(10))
+		assert.NoError(t, err)
+		assert.True(t, recorded)
+		assert.False(t, cluster.findOrCreateAggregateContainerState(testContainerID).AggregateMemoryPeaks.IsEmpty())
+	})
+
+	t.Run("skips an OOM already represented in the checkpoint-loaded aggregate", func(t *testing.T) {
+		cluster := NewClusterState(testGcPeriod)
+		cluster.AddOrUpdatePod(testPodID, testLabels, corev1.PodRunning)
+		assert.NoError(t, cluster.AddOrUpdateContainer(testContainerID, testRequest))
+		// Boundary must come from the checkpoint the way production loads it:
+		// into the controlling VPA's ContainersInitialAggregateState, NOT the
+		// live aggregate (which is empty at boot). Emulate a checkpoint whose
+		// newest folded sample is at t=200; an OOM at t=150 is already
+		// represented and must not be re-counted on boot.
+		vpa := addTestVpa(cluster)
+		initial := NewAggregateContainerState()
+		initial.LastSampleStart = time.Unix(200, 0)
+		vpa.ContainersInitialAggregateState[testContainerID.ContainerName] = initial
+
+		recorded, err := cluster.RecordOOMFromPodState(testContainerID, time.Unix(150, 0), ResourceAmount(10))
+		assert.NoError(t, err)
+		assert.False(t, recorded)
+		assert.True(t, cluster.findOrCreateAggregateContainerState(testContainerID).AggregateMemoryPeaks.IsEmpty())
+	})
+
+	t.Run("missing pod returns a KeyError and records nothing", func(t *testing.T) {
+		cluster := NewClusterState(testGcPeriod)
+		recorded, err := cluster.RecordOOMFromPodState(testContainerID, time.Unix(100, 0), ResourceAmount(10))
+		assert.False(t, recorded)
+		assert.EqualError(t, err, "KeyError: {namespace-1 pod-1}")
+	})
+}
+
 // Verifies that AddSample and AddOrUpdateContainer methods return a proper
 // KeyError when referring to a non-existent pod.
 func TestMissingKeys(t *testing.T) {

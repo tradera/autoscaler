@@ -27,11 +27,14 @@ import (
 	"go.uber.org/mock/gomock"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	core "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2/ktesting"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -483,6 +486,70 @@ func TestClusterStateFeeder_LoadPods_ContainerTracking(t *testing.T) {
 	assert.Equal(t, len(feeder.clusterState.Pods()[podWithInitContainersID].InitContainers), 2)
 	assert.Equal(t, len(feeder.clusterState.Pods()[podWithoutInitContainersID].Containers), 2)
 	assert.Equal(t, len(feeder.clusterState.Pods()[podWithoutInitContainersID].InitContainers), 0)
+}
+
+func TestClusterStateFeeder_ReconcileOOMsFromPodState(t *testing.T) {
+	podID := model.PodID{Namespace: "default", PodName: "denormalizer"}
+	const containerName = "container1"
+	containerID := model.ContainerID{PodID: podID, ContainerName: containerName}
+
+	// A running pod whose previous instance was OOMKilled: the kill survives on
+	// LastTerminationState even though the live observer (OnAdd no-op) never saw
+	// the transition.
+	makePod := func(finishedAt time.Time, requestMi int64) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: podID.Namespace, Name: podID.PodName},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name: containerName,
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceMemory: *resource.NewQuantity(requestMi*1024*1024, resource.BinarySI),
+				}},
+			}}},
+			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+				Name: containerName,
+				LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					Reason: "OOMKilled", FinishedAt: metav1.NewTime(finishedAt),
+				}},
+			}}},
+		}
+	}
+
+	specClient := &testSpecClient{pods: []*spec.BasicPodSpec{
+		newTestPodSpec(podID, []spec.BasicContainerSpec{
+			newTestContainerSpec(podID, containerName, 100, 256*1024*1024),
+		}, nil),
+	}}
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	assert.NoError(t, indexer.Add(makePod(time.Now().Add(-2*time.Minute), 256)))
+	podLister := listersv1.NewPodLister(indexer)
+
+	clusterState := model.NewClusterState(testGcPeriod)
+	feeder := clusterStateFeeder{
+		specClient:   specClient,
+		clusterState: clusterState,
+		podLister:    podLister,
+	}
+
+	// First load tracks the pod and runs the one-shot reconcile, recovering the
+	// OOM the live observer never saw.
+	feeder.LoadPods()
+	assert.True(t, feeder.oomBootReconcileDone)
+	container := clusterState.GetContainer(containerID)
+	if !assert.NotNil(t, container) {
+		return
+	}
+	recovered := container.GetMaxMemoryPeak()
+	assert.NotZero(t, recovered, "boot reconcile should recover the OOM from pod state")
+
+	// Run-once guard: replace the pod with a newer, larger OOM and load again.
+	// The reconcile already ran, so it must be skipped — re-reading the sticky
+	// LastTerminationState every loop would re-count OOMs and inflate the
+	// recommendation (the bump loop). The recovered signal must not change.
+	assert.NoError(t, indexer.Update(makePod(time.Now(), 1024)))
+	feeder.LoadPods()
+	assert.Equal(t, recovered, clusterState.GetContainer(containerID).GetMaxMemoryPeak(),
+		"reconcile must run only once; subsequent loads must not re-record OOMs")
 }
 
 func TestClusterStateFeeder_LoadPods_MemorySaverMode(t *testing.T) {

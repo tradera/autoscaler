@@ -123,6 +123,62 @@ func findStatus(name string, containerStatuses []corev1.ContainerStatus) *corev1
 	return nil
 }
 
+// OOMsFromPod scans a pod's container statuses for OOMKill events recorded in
+// State.Terminated or LastTerminationState.Terminated and returns one OomInfo
+// per container that shows an OOMKill (the most recent of the two states). The
+// memory is the container's current request and the timestamp is the kill's
+// FinishedAt.
+//
+// Unlike OnUpdate, which is edge-triggered on live pod transitions, this reads a
+// single snapshot of durable Pod state. It exists for boot-time reconciliation:
+// the live observer ignores OnAdd, so OOMs that fired while the recommender was
+// down would otherwise be lost even though Kubernetes still records them on the
+// Pod. Callers must de-duplicate against already-recorded OOMs (see
+// clusterState.RecordOOMFromPodState) — LastTerminationState is sticky.
+func OOMsFromPod(pod *corev1.Pod) []OomInfo {
+	var result []OomInfo
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		terminated := mostRecentOOMKill(containerStatus)
+		if terminated == nil {
+			continue
+		}
+		var memory resource.Quantity
+		if requests, _ := resourcehelpers.ContainerRequestsAndLimits(containerStatus.Name, pod); requests != nil {
+			memory = requests[corev1.ResourceMemory]
+		}
+		result = append(result, OomInfo{
+			Timestamp: terminated.FinishedAt.UTC(),
+			Memory:    model.ResourceAmount(memory.Value()),
+			ContainerID: model.ContainerID{
+				PodID: model.PodID{
+					Namespace: pod.Namespace,
+					PodName:   pod.Name,
+				},
+				ContainerName: containerStatus.Name,
+			},
+		})
+	}
+	return result
+}
+
+// mostRecentOOMKill returns the more recent of the container's current and
+// previous terminated states that ended with reason OOMKilled, or nil if
+// neither was an OOMKill.
+func mostRecentOOMKill(containerStatus corev1.ContainerStatus) *corev1.ContainerStateTerminated {
+	var best *corev1.ContainerStateTerminated
+	consider := func(t *corev1.ContainerStateTerminated) {
+		if t == nil || t.Reason != "OOMKilled" {
+			return
+		}
+		if best == nil || t.FinishedAt.After(best.FinishedAt.Time) {
+			best = t
+		}
+	}
+	consider(containerStatus.State.Terminated)
+	consider(containerStatus.LastTerminationState.Terminated)
+	return best
+}
+
 // OnAdd is Noop
 func (o *observer) OnAdd(obj any, isInInitialList bool) {}
 
