@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -165,6 +166,70 @@ func newEvent(yaml string) (*corev1.Event, error) {
 		return nil, err
 	}
 	return obj.(*corev1.Event), nil
+}
+
+func TestOOMsFromPod(t *testing.T) {
+	oomTime, _ := time.Parse(time.RFC3339, "2018-02-23T13:38:48Z")
+	wantContainerID := model.ContainerID{
+		PodID:         model.PodID{Namespace: "mockNamespace", PodName: "Pod1"},
+		ContainerName: "Name11",
+	}
+
+	cases := []struct {
+		desc     string
+		podYaml  string
+		wantOOMs int
+		wantTime time.Time
+	}{
+		{desc: "currently terminated OOMKilled", podYaml: oomPodYaml, wantOOMs: 1, wantTime: oomTime},
+		{desc: "running after OOM restart (LastTerminationState)", podYaml: runningAfterOOMRestartYaml, wantOOMs: 1, wantTime: oomTime},
+		{desc: "crash-looping after OOM (Waiting + LastTerminationState)", podYaml: waitingCrashLoopOOMYaml, wantOOMs: 1, wantTime: oomTime},
+		{desc: "running, never terminated", podYaml: runningPodYaml, wantOOMs: 0},
+		{desc: "terminated, non-OOM reason", podYaml: terminatedNonOOMYaml, wantOOMs: 0},
+		{desc: "terminated, no reason", podYaml: terminatedNoReasonYaml, wantOOMs: 0},
+		{desc: "restarted for a non-OOM reason", podYaml: runningAfterNonOOMRestartYaml, wantOOMs: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			pod := mustNewPod(t, tc.podYaml)
+			ooms := OOMsFromPod(pod)
+			assert.Len(t, ooms, tc.wantOOMs)
+			if tc.wantOOMs == 1 {
+				assert.Equal(t, wantContainerID, ooms[0].ContainerID)
+				assert.True(t, ooms[0].Timestamp.Equal(tc.wantTime), "timestamp %v != %v", ooms[0].Timestamp, tc.wantTime)
+				assert.Equal(t, model.ResourceAmount(1024), ooms[0].Memory)
+			}
+		})
+	}
+}
+
+// TestOOMsFromPodPicksMostRecentKill verifies that when both the current and
+// previous terminations were OOMKills, the more recent FinishedAt wins.
+func TestOOMsFromPodPicksMostRecentKill(t *testing.T) {
+	older, _ := time.Parse(time.RFC3339, "2018-02-23T13:00:00Z")
+	newer, _ := time.Parse(time.RFC3339, "2018-02-23T13:38:48Z")
+	oomTerminated := func(ts time.Time) *corev1.ContainerStateTerminated {
+		return &corev1.ContainerStateTerminated{Reason: "OOMKilled", FinishedAt: metav1.NewTime(ts)}
+	}
+
+	for _, tc := range []struct {
+		desc          string
+		current, prev time.Time
+		want          time.Time
+	}{
+		{desc: "current kill newer", current: newer, prev: older, want: newer},
+		{desc: "previous kill newer", current: older, prev: newer, want: newer},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			pod := mustNewPod(t, runningPodYaml)
+			pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Terminated: oomTerminated(tc.current)}
+			pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{Terminated: oomTerminated(tc.prev)}
+			ooms := OOMsFromPod(pod)
+			if assert.Len(t, ooms, 1) {
+				assert.True(t, ooms[0].Timestamp.Equal(tc.want), "timestamp %v != %v", ooms[0].Timestamp, tc.want)
+			}
+		})
+	}
 }
 
 func TestOOMObserverOnUpdate(t *testing.T) {

@@ -50,6 +50,7 @@ type ClusterState interface {
 	AddOrUpdateContainer(containerID ContainerID, request Resources) error
 	AddSample(sample *ContainerUsageSampleWithKey) error
 	RecordOOM(containerID ContainerID, timestamp time.Time, requestedMemory ResourceAmount) error
+	RecordOOMFromPodState(containerID ContainerID, timestamp time.Time, requestedMemory ResourceAmount) (bool, error)
 	AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAutoscaler, selector labels.Selector) error
 	DeleteVpa(vpaID VpaID) error
 	MakeAggregateStateKey(pod *PodState, containerName string) AggregateStateKey
@@ -271,6 +272,42 @@ func (cluster *clusterState) RecordOOM(containerID ContainerID, timestamp time.T
 		return fmt.Errorf("error while recording OOM for %v, Reason: %v", containerID, err)
 	}
 	return nil
+}
+
+// RecordOOMFromPodState records an OOM discovered by reading a pod's container
+// termination state (LastTerminationState/State) rather than by observing a
+// live pod transition. It exists so a freshly (re)started recommender can
+// recover OOMs that fired while it was down: the live oom.Observer only reacts
+// to OnUpdate transitions and ignores OnAdd, so an OOM that happened before the
+// process started would otherwise be lost even though Kubernetes still records
+// it on the Pod.
+//
+// Because LastTerminationState is sticky (it keeps reporting the same OOMKill
+// until the next termination), re-reading it on every boot must not inflate the
+// recommendation. The OOM is recorded only if it post-dates the last sample
+// already folded into the aggregate that was loaded from the checkpoint
+// (LastSampleStart) — a checkpointed OOM always has LastSampleStart >= its
+// timestamp, so it is skipped. This makes the reconcile loop-safe (it can never
+// re-count an OOM that is already represented) at the cost of occasionally
+// skipping a just-missed OOM, which is the safe direction. Returns whether the
+// OOM was recorded.
+func (cluster *clusterState) RecordOOMFromPodState(containerID ContainerID, timestamp time.Time, requestedMemory ResourceAmount) (bool, error) {
+	pod, podExists := cluster.pods[containerID.PodID]
+	if !podExists {
+		return false, NewKeyError(containerID.PodID)
+	}
+	if _, containerExists := pod.Containers[containerID.ContainerName]; !containerExists {
+		return false, NewKeyError(containerID.ContainerName)
+	}
+	aggregate := cluster.findOrCreateAggregateContainerState(containerID)
+	if !timestamp.After(aggregate.LastSampleStart) {
+		// Already represented in the checkpoint-loaded aggregate.
+		return false, nil
+	}
+	if err := cluster.RecordOOM(containerID, timestamp, requestedMemory); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AddOrUpdateVpa adds a new VPA with a given ID to the clusterState if it

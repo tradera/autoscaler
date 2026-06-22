@@ -110,6 +110,7 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		vpaCheckpointLister: m.VpaCheckpointLister,
 		vpaLister:           m.VpaLister,
 		clusterState:        m.ClusterState,
+		podLister:           m.PodLister,
 		specClient:          spec.NewSpecClient(m.PodLister),
 		selectorFetcher:     m.SelectorFetcher,
 		memorySaveMode:      m.MemorySaveMode,
@@ -220,6 +221,7 @@ type clusterStateFeeder struct {
 	coreClient          typedcorev1.CoreV1Interface
 	specClient          spec.SpecClient
 	metricsClient       metrics.MetricsClient
+	podLister           listersv1.PodLister
 	oomChan             <-chan oom.OomInfo
 	vpaCheckpointClient vpa_api.VerticalPodAutoscalerCheckpointsGetter
 	vpaCheckpointLister vpa_lister.VerticalPodAutoscalerCheckpointLister
@@ -231,6 +233,13 @@ type clusterStateFeeder struct {
 	recommenderName     string
 	ignoredNamespaces   []string
 	vpaObjectNamespace  string
+
+	// oomBootReconcileDone guards the one-shot startup pass that recovers OOMs
+	// from durable Pod state (see reconcileOOMsFromPodState). It runs once,
+	// after the first LoadPods, so a (re)started recommender re-reads OOMs the
+	// live observer missed while it was down without re-counting them on every
+	// subsequent loop.
+	oomBootReconcileDone bool
 
 	// Per-VPA history backfill. perVPABackfiller is nil when disabled.
 	// backfillSem bounds concurrency so a mass-arrival of opted-in VPAs
@@ -589,6 +598,48 @@ func (feeder *clusterStateFeeder) LoadPods() {
 			feeder.clusterState.Pods()[pod.ID].InitContainers = append(podInitContainers, initContainer.ID.ContainerName)
 		}
 	}
+	feeder.reconcileOOMsFromPodState()
+}
+
+// reconcileOOMsFromPodState runs once, right after the first LoadPods. The live
+// oom.Observer only records OOMs it witnesses as pod updates (OnAdd is a no-op),
+// so any OOMKill that fired while this recommender was down — including in the
+// gap between an eviction and the replacement pod becoming ready — is invisible
+// to it even though Kubernetes still reports it on the Pod's container statuses.
+// This pass reads that durable state for the pods already in cluster state and
+// records each OOM not yet represented in the (checkpoint-loaded) aggregate, so
+// the recommender recovers its OOM signal across restarts instead of depending
+// on never being rescheduled. Subsequent loops rely on the live observer.
+func (feeder *clusterStateFeeder) reconcileOOMsFromPodState() {
+	if feeder.oomBootReconcileDone {
+		return
+	}
+	feeder.oomBootReconcileDone = true
+	if feeder.podLister == nil {
+		return
+	}
+
+	recorded := 0
+	trackedPods := feeder.clusterState.Pods()
+	for podID := range trackedPods {
+		pod, err := feeder.podLister.Pods(podID.Namespace).Get(podID.PodName)
+		if err != nil {
+			klog.V(4).InfoS("Boot OOM reconcile: pod not found in lister", "pod", klog.KRef(podID.Namespace, podID.PodName), "error", err)
+			continue
+		}
+		for _, oomInfo := range oom.OOMsFromPod(pod) {
+			did, err := feeder.clusterState.RecordOOMFromPodState(oomInfo.ContainerID, oomInfo.Timestamp, oomInfo.Memory)
+			if err != nil {
+				klog.V(4).InfoS("Boot OOM reconcile: failed to record OOM", "oomInfo", oomInfo, "error", err)
+				continue
+			}
+			if did {
+				recorded++
+				klog.V(3).InfoS("Boot OOM reconcile: recovered OOM from pod state", "oomInfo", oomInfo)
+			}
+		}
+	}
+	klog.V(2).InfoS("Boot OOM reconcile from pod state complete", "trackedPods", len(trackedPods), "oomsRecorded", recorded)
 }
 
 func (feeder *clusterStateFeeder) LoadRealTimeMetrics(ctx context.Context) {
