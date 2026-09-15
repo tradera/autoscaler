@@ -103,7 +103,16 @@ type ClusterStateFeederFactory struct {
 
 // Make creates new ClusterStateFeeder with internal data providers, based on kube client.
 func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
+	// Assign through a nil check rather than directly: a nil
+	// *history.PerVPAProvider stored in a vpaHistoryProvider interface is a
+	// non-nil interface value, which would defeat the `perVPABackfiller == nil`
+	// disabled-check in maybeStartHistoryBackfill and panic on the first VPA.
+	var backfiller vpaHistoryProvider
+	if m.PerVPABackfiller != nil {
+		backfiller = m.PerVPABackfiller
+	}
 	return &clusterStateFeeder{
+		perVPABackfiller:    backfiller,
 		coreClient:          m.KubeClient.CoreV1(),
 		metricsClient:       m.MetricsClient,
 		oomChan:             m.OOMObserver.GetObservedOomsChannel(),
@@ -119,7 +128,6 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		recommenderName:     m.RecommenderName,
 		ignoredNamespaces:   m.IgnoredNamespaces,
 		vpaObjectNamespace:  m.VpaObjectNamespace,
-		perVPABackfiller:    m.PerVPABackfiller,
 		backfilledVPAs:      make(map[model.VpaID]struct{}),
 		backfillSem:         make(chan struct{}, maxConcurrentBackfills),
 		backfillResults:     make(chan vpaBackfillResult, maxConcurrentBackfills),
@@ -247,7 +255,7 @@ type clusterStateFeeder struct {
 	// backfillSem bounds concurrency so a mass-arrival of opted-in VPAs
 	// (e.g. recovery after restart) doesn't fan out 1000 range queries
 	// against Prometheus at once.
-	perVPABackfiller *history.PerVPAProvider
+	perVPABackfiller vpaHistoryProvider
 	backfillMu       sync.Mutex
 	backfilledVPAs   map[model.VpaID]struct{}
 	backfillSem      chan struct{}
@@ -256,6 +264,13 @@ type clusterStateFeeder struct {
 	// clusterState. Buffered by maxConcurrentBackfills so a fetcher that
 	// finishes mid-iteration does not block until the next LoadVPAs.
 	backfillResults chan vpaBackfillResult
+}
+
+// vpaHistoryProvider is the slice of history.PerVPAProvider the feeder needs,
+// named so tests can substitute a stub and exercise the fetch goroutine — the
+// same pattern history.HistoryProvider already uses for InitFromHistoryProvider.
+type vpaHistoryProvider interface {
+	GetVPAHistory(ctx context.Context, vpaID model.VpaID, vpaAnnotations map[string]string) (map[model.PodID]*history.PodHistory, error)
 }
 
 // vpaBackfillResult is one VPA's Prometheus history, fetched off the main
