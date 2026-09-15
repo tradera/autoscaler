@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1000,4 +1001,88 @@ func TestCanCleanupCheckpoints(t *testing.T) {
 	for _, vpa := range vpas {
 		assert.NotContains(t, deletedCheckpoints, vpa.Name)
 	}
+}
+
+// makeBackfillFeeder builds a feeder wired for per-VPA history backfill, with
+// one VPA already known to the model.
+func makeBackfillFeeder(t *testing.T) (*clusterStateFeeder, model.ClusterState, model.VpaID) {
+	t.Helper()
+	clusterState := model.NewClusterState(testGcPeriod)
+	vpaID := model.VpaID{Namespace: "ns", VpaName: "vpa"}
+	vpaCRD := &vpa_types.VerticalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Namespace: vpaID.Namespace, Name: vpaID.VpaName},
+	}
+	require.NoError(t, clusterState.AddOrUpdateVpa(vpaCRD, labels.Everything()))
+
+	feeder := &clusterStateFeeder{
+		clusterState:    clusterState,
+		backfilledVPAs:  make(map[model.VpaID]struct{}),
+		backfillSem:     make(chan struct{}, maxConcurrentBackfills),
+		backfillResults: make(chan vpaBackfillResult, maxConcurrentBackfills),
+	}
+	return feeder, clusterState, vpaID
+}
+
+func backfillHistory(podName string) map[model.PodID]*history.PodHistory {
+	podID := model.PodID{Namespace: "ns", PodName: podName}
+	return map[model.PodID]*history.PodHistory{
+		podID: {
+			LastLabels: map[string]string{},
+			Samples: map[string][]model.ContainerUsageSample{
+				"ctr": {
+					{
+						MeasureStart: time.Unix(1, 0),
+						Usage:        model.ResourceAmount(100),
+						Resource:     model.ResourceCPU,
+					},
+				},
+			},
+		},
+	}
+}
+
+// A completed backfill must not reach clusterState until the main goroutine
+// drains it. clusterState is single-writer by design; the previous version
+// wrote to it straight from the fetching goroutine, which crashed the
+// recommender with "concurrent map read and map write".
+func TestApplyPendingBackfillsOnlyWritesWhenDrained(t *testing.T) {
+	feeder, clusterState, vpaID := makeBackfillFeeder(t)
+
+	feeder.backfillResults <- vpaBackfillResult{vpaID: vpaID, history: backfillHistory("pod-1")}
+	assert.Empty(t, clusterState.Pods(), "backfill result must not be applied before it is drained")
+
+	feeder.applyPendingBackfills()
+
+	podID := model.PodID{Namespace: "ns", PodName: "pod-1"}
+	require.Contains(t, clusterState.Pods(), podID)
+	assert.NotNil(t, clusterState.GetContainer(model.ContainerID{PodID: podID, ContainerName: "ctr"}))
+}
+
+// Draining is non-blocking: it returns immediately when nothing is pending, so
+// LoadVPAs never stalls waiting on a Prometheus query.
+func TestApplyPendingBackfillsIsNonBlockingWhenEmpty(t *testing.T) {
+	feeder, clusterState, _ := makeBackfillFeeder(t)
+
+	feeder.applyPendingBackfills()
+
+	assert.Empty(t, clusterState.Pods())
+}
+
+// A backfill for a VPA that disappeared while its history was in flight is
+// dropped rather than resurrecting pods for a workload we no longer track.
+func TestApplyPendingBackfillsDropsResultForDeletedVPA(t *testing.T) {
+	feeder, clusterState, _ := makeBackfillFeeder(t)
+	goneVpaID := model.VpaID{Namespace: "ns", VpaName: "deleted-vpa"}
+
+	feeder.backfillResults <- vpaBackfillResult{vpaID: goneVpaID, history: backfillHistory("pod-2")}
+	feeder.applyPendingBackfills()
+
+	assert.Empty(t, clusterState.Pods())
+}
+
+// A feeder with backfill disabled (nil channel) must not block or panic.
+func TestApplyPendingBackfillsNoopWhenDisabled(t *testing.T) {
+	feeder := &clusterStateFeeder{clusterState: model.NewClusterState(testGcPeriod)}
+
+	feeder.applyPendingBackfills()
 }

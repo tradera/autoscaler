@@ -91,7 +91,7 @@ func TestPerVPAProvider_NoAnnotations(t *testing.T) {
 	api := &fakeRangeAPI{}
 	p := newProvider(api)
 
-	got, err := p.GetVPAHistory(context.Background(), vpa("ns", "v", nil))
+	got, err := p.GetVPAHistory(context.Background(), model.VpaID{Namespace: "ns", VpaName: "v"}, nil)
 	assert.NoError(t, err)
 	assert.Empty(t, got)
 	assert.Empty(t, api.queries, "no queries should be issued for VPAs without history annotations")
@@ -109,7 +109,7 @@ func TestPerVPAProvider_MemoryOnly(t *testing.T) {
 		annotations.HistoryQueryMemoryAnnotation: memQuery,
 	})
 
-	got, err := p.GetVPAHistory(context.Background(), v)
+	got, err := p.GetVPAHistory(context.Background(), v.ID, v.Annotations)
 	assert.NoError(t, err)
 	assert.Equal(t, []string{memQuery}, api.queries, "only the memory query should be issued")
 
@@ -136,7 +136,7 @@ func TestPerVPAProvider_BothQueries(t *testing.T) {
 		annotations.HistoryQueryMemoryAnnotation: memQuery,
 	})
 
-	got, err := p.GetVPAHistory(context.Background(), v)
+	got, err := p.GetVPAHistory(context.Background(), v.ID, v.Annotations)
 	assert.NoError(t, err)
 	assert.Len(t, api.queries, 2, "both queries issued")
 	assert.Contains(t, api.queries, cpuQuery)
@@ -152,7 +152,7 @@ func TestPerVPAProvider_QueryError(t *testing.T) {
 	v := vpa("ns", "v", map[string]string{
 		annotations.HistoryQueryMemoryAnnotation: "x",
 	})
-	_, err := p.GetVPAHistory(context.Background(), v)
+	_, err := p.GetVPAHistory(context.Background(), v.ID, v.Annotations)
 	assert.Error(t, err)
 }
 
@@ -179,7 +179,7 @@ func TestPerVPAProvider_DropsSeriesWithoutLabels(t *testing.T) {
 	p := newProvider(api)
 	v := vpa("ns", "v", map[string]string{annotations.HistoryQueryMemoryAnnotation: memQuery})
 
-	got, _ := p.GetVPAHistory(context.Background(), v)
+	got, _ := p.GetVPAHistory(context.Background(), v.ID, v.Annotations)
 	assert.Len(t, got, 1, "only the fully-labeled series should produce a pod history")
 	assert.Contains(t, got, model.PodID{Namespace: "ns", PodName: "ok-pod"})
 }

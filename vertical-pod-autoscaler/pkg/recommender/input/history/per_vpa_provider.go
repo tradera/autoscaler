@@ -72,20 +72,26 @@ func NewPerVPAProvider(api prometheusv1.API, opts PerVPAProviderOpts) *PerVPAPro
 // GetVPAHistory issues range queries for whichever resources the VPA opted
 // into via annotations and returns a per-pod sample history. Returns an
 // empty map (and no error) for VPAs without any history annotations.
-func (p *PerVPAProvider) GetVPAHistory(ctx context.Context, vpa *model.Vpa) (map[model.PodID]*PodHistory, error) {
+//
+// It deliberately takes the VPA's identity and a snapshot of its annotations
+// rather than the live *model.Vpa. Callers run this off the recommender's main
+// goroutine, and the main goroutine reassigns Vpa.Annotations on every
+// LoadVPAs iteration (clusterState.AddOrUpdateVpa) — holding the shared
+// pointer here would be a data race on that field.
+func (p *PerVPAProvider) GetVPAHistory(ctx context.Context, vpaID model.VpaID, vpaAnnotations map[string]string) (map[model.PodID]*PodHistory, error) {
 	res := make(map[model.PodID]*PodHistory)
 	resources := []struct {
 		query    string
 		resource model.ResourceName
 	}{
-		{annotations.HistoryQueryForResource(vpa.Annotations, corev1.ResourceCPU), model.ResourceCPU},
-		{annotations.HistoryQueryForResource(vpa.Annotations, corev1.ResourceMemory), model.ResourceMemory},
+		{annotations.HistoryQueryForResource(vpaAnnotations, corev1.ResourceCPU), model.ResourceCPU},
+		{annotations.HistoryQueryForResource(vpaAnnotations, corev1.ResourceMemory), model.ResourceMemory},
 	}
 	for _, r := range resources {
 		if r.query == "" {
 			continue
 		}
-		if err := p.readQueryRange(ctx, res, vpa.ID.Namespace, r.query, r.resource); err != nil {
+		if err := p.readQueryRange(ctx, res, vpaID.Namespace, r.query, r.resource); err != nil {
 			return nil, fmt.Errorf("backfill %s: %w", r.resource, err)
 		}
 	}
