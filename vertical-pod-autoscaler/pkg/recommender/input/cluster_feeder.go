@@ -19,6 +19,7 @@ package input
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -102,7 +103,16 @@ type ClusterStateFeederFactory struct {
 
 // Make creates new ClusterStateFeeder with internal data providers, based on kube client.
 func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
+	// Assign through a nil check rather than directly: a nil
+	// *history.PerVPAProvider stored in a vpaHistoryProvider interface is a
+	// non-nil interface value, which would defeat the `perVPABackfiller == nil`
+	// disabled-check in maybeStartHistoryBackfill and panic on the first VPA.
+	var backfiller vpaHistoryProvider
+	if m.PerVPABackfiller != nil {
+		backfiller = m.PerVPABackfiller
+	}
 	return &clusterStateFeeder{
+		perVPABackfiller:    backfiller,
 		coreClient:          m.KubeClient.CoreV1(),
 		metricsClient:       m.MetricsClient,
 		oomChan:             m.OOMObserver.GetObservedOomsChannel(),
@@ -118,9 +128,9 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		recommenderName:     m.RecommenderName,
 		ignoredNamespaces:   m.IgnoredNamespaces,
 		vpaObjectNamespace:  m.VpaObjectNamespace,
-		perVPABackfiller:    m.PerVPABackfiller,
 		backfilledVPAs:      make(map[model.VpaID]struct{}),
 		backfillSem:         make(chan struct{}, maxConcurrentBackfills),
+		backfillResults:     make(chan vpaBackfillResult, maxConcurrentBackfills),
 	}
 }
 
@@ -245,10 +255,29 @@ type clusterStateFeeder struct {
 	// backfillSem bounds concurrency so a mass-arrival of opted-in VPAs
 	// (e.g. recovery after restart) doesn't fan out 1000 range queries
 	// against Prometheus at once.
-	perVPABackfiller *history.PerVPAProvider
+	perVPABackfiller vpaHistoryProvider
 	backfillMu       sync.Mutex
 	backfilledVPAs   map[model.VpaID]struct{}
 	backfillSem      chan struct{}
+	// backfillResults carries fetched histories from the backfill goroutines
+	// back to the main goroutine, which is the only one allowed to write to
+	// clusterState. Buffered by maxConcurrentBackfills so a fetcher that
+	// finishes mid-iteration does not block until the next LoadVPAs.
+	backfillResults chan vpaBackfillResult
+}
+
+// vpaHistoryProvider is the slice of history.PerVPAProvider the feeder needs,
+// named so tests can substitute a stub and exercise the fetch goroutine — the
+// same pattern history.HistoryProvider already uses for InitFromHistoryProvider.
+type vpaHistoryProvider interface {
+	GetVPAHistory(ctx context.Context, vpaID model.VpaID, vpaAnnotations map[string]string) (map[model.PodID]*history.PodHistory, error)
+}
+
+// vpaBackfillResult is one VPA's Prometheus history, fetched off the main
+// goroutine and waiting to be applied on it.
+type vpaBackfillResult struct {
+	vpaID   model.VpaID
+	history map[model.PodID]*history.PodHistory
 }
 
 // maxConcurrentBackfills caps how many per-VPA history backfill goroutines
@@ -453,6 +482,11 @@ func filterVPAs(feeder *clusterStateFeeder, allVpaCRDs []*vpa_types.VerticalPodA
 
 // LoadVPAs fetches VPA objects and loads them into the cluster state.
 func (feeder *clusterStateFeeder) LoadVPAs(ctx context.Context) {
+	// Apply any history backfills that completed since the last iteration.
+	// This is deliberately done here, on the main goroutine, rather than in
+	// the fetching goroutine — see fetchHistoryBackfill.
+	feeder.applyPendingBackfills()
+
 	// List VPA API objects.
 	allVpaCRDs, err := feeder.vpaLister.List(labels.Everything())
 	if err != nil {
@@ -526,25 +560,65 @@ func (feeder *clusterStateFeeder) maybeStartHistoryBackfill(vpaID model.VpaID) {
 	feeder.backfilledVPAs[vpaID] = struct{}{}
 	feeder.backfillMu.Unlock()
 
-	go feeder.runHistoryBackfill(vpaID)
+	// Snapshot the annotations here, on the main goroutine. AddOrUpdateVpa
+	// reassigns vpa.Annotations on every LoadVPAs iteration, so handing the
+	// live *model.Vpa to the worker would race that write.
+	go feeder.fetchHistoryBackfill(vpaID, maps.Clone(vpa.Annotations))
 }
 
-func (feeder *clusterStateFeeder) runHistoryBackfill(vpaID model.VpaID) {
+// fetchHistoryBackfill runs the Prometheus range query for one VPA off the
+// main goroutine and hands the result back over backfillResults. It must not
+// touch clusterState, nor any object clusterState hands out: clusterState is
+// single-writer by design (its RWMutex is only taken by DeleteVpa and
+// RecordRecommendation), so mutating it from here raced the recommender loop
+// and crashed the process with Go's unrecoverable "concurrent map read and
+// map write" fatal error. That is why this takes a VpaID plus an annotations
+// snapshot rather than the live *model.Vpa.
+//
+// The send happens before the semaphore slot is released, so a main loop that
+// is slow to drain applies backpressure to the fetchers instead of letting
+// fetched histories pile up in memory.
+func (feeder *clusterStateFeeder) fetchHistoryBackfill(vpaID model.VpaID, vpaAnnotations map[string]string) {
 	feeder.backfillSem <- struct{}{}
 	defer func() { <-feeder.backfillSem }()
 
-	vpa, ok := feeder.clusterState.VPAs()[vpaID]
-	if !ok {
-		return
-	}
 	klog.V(2).InfoS("Per-VPA history backfill: starting", "vpa", klog.KRef(vpaID.Namespace, vpaID.VpaName))
-	hist, err := feeder.perVPABackfiller.GetVPAHistory(context.Background(), vpa)
+	hist, err := feeder.perVPABackfiller.GetVPAHistory(context.Background(), vpaID, vpaAnnotations)
 	if err != nil {
 		klog.ErrorS(err, "Per-VPA history backfill failed", "vpa", klog.KRef(vpaID.Namespace, vpaID.VpaName))
 		return
 	}
+	feeder.backfillResults <- vpaBackfillResult{vpaID: vpaID, history: hist}
+}
+
+// applyPendingBackfills drains completed backfills into clusterState. It is
+// called from LoadVPAs and therefore always runs on the recommender's main
+// goroutine, which is what keeps clusterState single-writer. Draining is
+// non-blocking: whatever is not ready yet is applied on a later iteration.
+func (feeder *clusterStateFeeder) applyPendingBackfills() {
+	if feeder.backfillResults == nil {
+		return
+	}
+	for {
+		select {
+		case res := <-feeder.backfillResults:
+			feeder.applyHistoryBackfill(res)
+		default:
+			return
+		}
+	}
+}
+
+func (feeder *clusterStateFeeder) applyHistoryBackfill(res vpaBackfillResult) {
+	// The VPA may have been deleted while its history was in flight; loading
+	// samples for a workload we no longer track would resurrect its pods in
+	// the model for no benefit.
+	if _, ok := feeder.clusterState.VPAs()[res.vpaID]; !ok {
+		klog.V(4).InfoS("Per-VPA history backfill: VPA gone before apply, dropping", "vpa", klog.KRef(res.vpaID.Namespace, res.vpaID.VpaName))
+		return
+	}
 	var samples int
-	for podID, ph := range hist {
+	for podID, ph := range res.history {
 		feeder.clusterState.AddOrUpdatePod(podID, ph.LastLabels, corev1.PodUnknown)
 		for ctrName, sampleList := range ph.Samples {
 			ctrID := model.ContainerID{PodID: podID, ContainerName: ctrName}
@@ -564,7 +638,7 @@ func (feeder *clusterStateFeeder) runHistoryBackfill(vpaID model.VpaID) {
 			}
 		}
 	}
-	klog.V(2).InfoS("Per-VPA history backfill: done", "vpa", klog.KRef(vpaID.Namespace, vpaID.VpaName), "pods", len(hist), "samples", samples)
+	klog.V(2).InfoS("Per-VPA history backfill: done", "vpa", klog.KRef(res.vpaID.Namespace, res.vpaID.VpaName), "pods", len(res.history), "samples", samples)
 }
 
 // LoadPods loads pod into the cluster state.

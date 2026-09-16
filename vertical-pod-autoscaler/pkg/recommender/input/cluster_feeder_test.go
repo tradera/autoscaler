@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -45,6 +46,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	target_mock "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/mock"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 )
 
@@ -1000,4 +1002,195 @@ func TestCanCleanupCheckpoints(t *testing.T) {
 	for _, vpa := range vpas {
 		assert.NotContains(t, deletedCheckpoints, vpa.Name)
 	}
+}
+
+// makeBackfillFeeder builds a feeder wired for per-VPA history backfill, with
+// one VPA already known to the model.
+func makeBackfillFeeder(t *testing.T, vpaAnnotations map[string]string) (*clusterStateFeeder, model.ClusterState, model.VpaID) {
+	t.Helper()
+	clusterState := model.NewClusterState(testGcPeriod)
+	vpaID := model.VpaID{Namespace: "ns", VpaName: "vpa"}
+	vpaCRD := &vpa_types.VerticalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   vpaID.Namespace,
+			Name:        vpaID.VpaName,
+			Annotations: vpaAnnotations,
+		},
+	}
+	require.NoError(t, clusterState.AddOrUpdateVpa(vpaCRD, labels.Everything()))
+
+	feeder := &clusterStateFeeder{
+		clusterState:    clusterState,
+		backfilledVPAs:  make(map[model.VpaID]struct{}),
+		backfillSem:     make(chan struct{}, maxConcurrentBackfills),
+		backfillResults: make(chan vpaBackfillResult, maxConcurrentBackfills),
+	}
+	return feeder, clusterState, vpaID
+}
+
+func newBackfillHistory(podName string) map[model.PodID]*history.PodHistory {
+	podID := model.PodID{Namespace: "ns", PodName: podName}
+	return map[model.PodID]*history.PodHistory{
+		podID: {
+			LastLabels: map[string]string{},
+			Samples: map[string][]model.ContainerUsageSample{
+				"ctr": {
+					{
+						MeasureStart: time.Unix(1, 0),
+						Usage:        model.ResourceAmount(100),
+						Resource:     model.ResourceCPU,
+					},
+				},
+			},
+		},
+	}
+}
+
+// A completed backfill must not reach clusterState until the main goroutine
+// drains it. clusterState is single-writer by design; the previous version
+// wrote to it straight from the fetching goroutine, which crashed the
+// recommender with "concurrent map read and map write".
+func TestApplyPendingBackfillsOnlyWritesWhenDrained(t *testing.T) {
+	feeder, clusterState, vpaID := makeBackfillFeeder(t, nil)
+
+	feeder.backfillResults <- vpaBackfillResult{vpaID: vpaID, history: newBackfillHistory("pod-1")}
+	assert.Empty(t, clusterState.Pods(), "backfill result must not be applied before it is drained")
+
+	feeder.applyPendingBackfills()
+
+	podID := model.PodID{Namespace: "ns", PodName: "pod-1"}
+	require.Contains(t, clusterState.Pods(), podID)
+	assert.NotNil(t, clusterState.GetContainer(model.ContainerID{PodID: podID, ContainerName: "ctr"}))
+}
+
+// Draining is non-blocking: it returns immediately when nothing is pending, so
+// LoadVPAs never stalls waiting on a Prometheus query.
+func TestApplyPendingBackfillsIsNonBlockingWhenEmpty(t *testing.T) {
+	feeder, clusterState, _ := makeBackfillFeeder(t, nil)
+
+	feeder.applyPendingBackfills()
+
+	assert.Empty(t, clusterState.Pods())
+}
+
+// A backfill for a VPA that disappeared while its history was in flight is
+// dropped rather than resurrecting pods for a workload we no longer track.
+func TestApplyPendingBackfillsDropsResultForDeletedVPA(t *testing.T) {
+	feeder, clusterState, _ := makeBackfillFeeder(t, nil)
+	goneVpaID := model.VpaID{Namespace: "ns", VpaName: "deleted-vpa"}
+
+	feeder.backfillResults <- vpaBackfillResult{vpaID: goneVpaID, history: newBackfillHistory("pod-2")}
+	feeder.applyPendingBackfills()
+
+	assert.Empty(t, clusterState.Pods())
+}
+
+// A feeder with backfill disabled (nil channel) must not block or panic.
+func TestApplyPendingBackfillsNoopWhenDisabled(t *testing.T) {
+	feeder := &clusterStateFeeder{clusterState: model.NewClusterState(testGcPeriod)}
+
+	feeder.applyPendingBackfills()
+}
+
+// stubHistoryProvider stands in for history.PerVPAProvider so the fetch
+// goroutine can be exercised without a live Prometheus. release, when set,
+// holds the fetch open until the test closes it.
+type stubHistoryProvider struct {
+	release <-chan struct{}
+	hist    map[model.PodID]*history.PodHistory
+	err     error
+}
+
+func (s *stubHistoryProvider) GetVPAHistory(_ context.Context, _ model.VpaID, _ map[string]string) (map[model.PodID]*history.PodHistory, error) {
+	if s.release != nil {
+		<-s.release
+	}
+	return s.hist, s.err
+}
+
+// The regression test for the production crash: the fetch goroutine must not
+// write clusterState. It is deliberately shaped so that the worker's post-fetch
+// work overlaps a stand-in "main loop" hammering clusterState — under `-race`
+// (which CI runs, hack/go-unit-tests-vpa.sh) a reintroduced write inside the
+// worker trips the detector, and even without `-race` the assertion below
+// catches it, because the backfilled pod must not appear until it is drained.
+func TestHistoryBackfillNeverWritesClusterStateFromTheWorker(t *testing.T) {
+	feeder, clusterState, vpaID := makeBackfillFeeder(t, map[string]string{
+		annotations.HistoryQueryCPUAnnotation: "some_metric{}",
+	})
+	backfilledPod := model.PodID{Namespace: "ns", PodName: "pod-1"}
+	release := make(chan struct{})
+	feeder.perVPABackfiller = &stubHistoryProvider{release: release, hist: newBackfillHistory(backfilledPod.PodName)}
+
+	feeder.maybeStartHistoryBackfill(vpaID)
+
+	// Stand-in for the recommender's main loop churning clusterState while a
+	// backfill is in flight — this is the access the worker used to race.
+	stop, writerDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			clusterState.AddOrUpdatePod(
+				model.PodID{Namespace: "ns", PodName: fmt.Sprintf("main-loop-%d", i)},
+				labels.Set{}, corev1.PodRunning)
+		}
+	}()
+	close(release)
+
+	var res vpaBackfillResult
+	select {
+	case res = <-feeder.backfillResults:
+	case <-time.After(10 * time.Second):
+		close(stop)
+		<-writerDone
+		t.Fatal("backfill result never arrived on backfillResults")
+	}
+	close(stop)
+	<-writerDone
+
+	assert.Equal(t, vpaID, res.vpaID)
+	assert.NotContains(t, clusterState.Pods(), backfilledPod,
+		"the fetch goroutine must hand results back, never write clusterState itself")
+
+	// The result was taken off the channel above, so apply it directly: the
+	// point is that applying is what makes it visible, and that only the main
+	// goroutine does it.
+	feeder.applyHistoryBackfill(res)
+	assert.Contains(t, clusterState.Pods(), backfilledPod)
+}
+
+// A failed fetch sends nothing, so the drain must stay a no-op rather than
+// block or apply a zero-valued result.
+func TestHistoryBackfillFetchErrorSendsNothing(t *testing.T) {
+	feeder, clusterState, vpaID := makeBackfillFeeder(t, map[string]string{
+		annotations.HistoryQueryCPUAnnotation: "some_metric{}",
+	})
+	feeder.perVPABackfiller = &stubHistoryProvider{err: errors.New("prometheus down")}
+
+	feeder.maybeStartHistoryBackfill(vpaID)
+
+	// The worker holds a semaphore slot until it returns; draining it back to
+	// empty proves the goroutine finished without sending.
+	require.Eventually(t, func() bool { return len(feeder.backfillSem) == 0 },
+		10*time.Second, 5*time.Millisecond)
+	assert.Empty(t, feeder.backfillResults)
+
+	feeder.applyPendingBackfills()
+	assert.Empty(t, clusterState.Pods())
+}
+
+// A VPA without history annotations must not dispatch a fetch at all.
+func TestHistoryBackfillSkipsVPAWithoutAnnotations(t *testing.T) {
+	feeder, _, vpaID := makeBackfillFeeder(t, nil)
+	feeder.perVPABackfiller = &stubHistoryProvider{hist: newBackfillHistory("pod-1")}
+
+	feeder.maybeStartHistoryBackfill(vpaID)
+
+	assert.NotContains(t, feeder.backfilledVPAs, vpaID)
+	assert.Empty(t, feeder.backfillResults)
 }
