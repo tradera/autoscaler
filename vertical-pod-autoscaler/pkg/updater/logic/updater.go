@@ -53,6 +53,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/restriction"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/utils"
 	metrics_updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/updater"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/status"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -85,6 +86,9 @@ type Updater interface {
 }
 
 type updater struct {
+	externalOOMClient            kube_client.Interface
+	externalOOMNamespace         string
+	externalOOMSignals           map[types.UID][]oomsignal.Signal
 	vpaLister                    vpa_lister.VerticalPodAutoscalerLister
 	podLister                    listersv1.PodLister
 	eventRecorder                record.EventRecorder
@@ -148,6 +152,7 @@ func NewUpdater(
 	)
 
 	u := &updater{
+		externalOOMClient: kubeClient, externalOOMNamespace: namespace,
 		vpaLister:                    vpa_api_util.NewVpasLister(vpaClient, make(chan struct{}), namespace),
 		podLister:                    podInformerFactory.Core().V1().Pods().Lister(),
 		eventRecorder:                newEventRecorder(kubeClient),
@@ -257,6 +262,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 		return
 	}
 
+	u.externalOOMSignals = u.readExternalOOMEvents(ctx, vpas)
 	podsList, err := u.podLister.List(labels.Everything())
 	if err != nil {
 		klog.ErrorS(err, "Failed to get pods list")
@@ -336,7 +342,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 
 		evictionLimiter := u.restrictionFactory.NewPodsEvictionRestriction(creatorToSingleGroupStatsMap, podToReplicaCreatorMap)
 		podsForEviction := make([]*corev1.Pod, 0)
-		podsForInPlace := make([]*corev1.Pod, 0)
+		podsForInPlace := make([]priority.PodUpdate, 0)
 		withInPlaceUpdatable := false
 		withEvictable := false
 
@@ -353,7 +359,9 @@ func (u *updater) RunOnce(ctx context.Context) {
 				continue
 			}
 			// We evict the pod when the mode is set to Recreate or Auto. The latter mode is deprecated.
-			podsForEviction = u.getPodsUpdateOrder(filterNonEvictablePods(podsAvailableForUpdate, evictionLimiter), vpa)
+			for _, update := range u.getPodsUpdateOrder(filterNonEvictablePods(podsAvailableForUpdate, evictionLimiter), vpa) {
+				podsForEviction = append(podsForEviction, update.Pod)
+			}
 			evictablePodsCounter.Add(vpaSize, updateMode, len(podsForEviction))
 			if len(podsForEviction) > 0 {
 				withEvictable = true
@@ -362,8 +370,12 @@ func (u *updater) RunOnce(ctx context.Context) {
 
 		withEvicted := false
 
-		for _, pod := range podsForInPlace {
-			decision := inPlaceLimiter.CanInPlaceUpdate(pod, vpa, u.infeasibleAttempts)
+		for _, update := range podsForInPlace {
+			pod, actionVPA := update.Pod, update.VPA
+			if update.ExternalOOM && vpa_api_util.PrepareExternalOOMUpdate(actionVPA, pod, actionVPA.Status.Recommendation, update.ExternalOOMSignals, time.Now()) == nil {
+				continue
+			}
+			decision := inPlaceLimiter.CanInPlaceUpdate(pod, actionVPA, u.infeasibleAttempts)
 
 			switch decision {
 			case utils.InPlaceDeferred:
@@ -376,6 +388,11 @@ func (u *updater) RunOnce(ctx context.Context) {
 				// Retry the in-place update implicitly by ignoring until the next loop.
 				klog.V(2).InfoS("In-place update deferred", "pod", klog.KObj(pod))
 			case utils.InPlaceEvict:
+				// An expedited application-OOM action is memory-only and must
+				// not recreate a pod with the ordinary cohort recommendation.
+				if update.ExternalOOM {
+					continue
+				}
 				// This should only happen for InPlaceOrRecreate mode
 				podsForEviction = append(podsForEviction, pod)
 				continue
@@ -392,7 +409,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 				// this status should only be returned with InPlace update mode (InPlaceOrRecreate will return InPlaceEvict in case of infeasible state)
 				// Fall through to attempt in-place update
 				klog.V(2).InfoS("In-place update infeasible, retrying with new recommendation", "pod", klog.KObj(pod))
-				u.recordInfeasibleAttempt(pod, vpa)
+				u.recordInfeasibleAttempt(pod, actionVPA)
 			case utils.InPlaceApproved:
 				klog.V(2).InfoS("In-place update approved", "pod", klog.KObj(pod))
 				// Proceed with in-place update
@@ -407,14 +424,17 @@ func (u *updater) RunOnce(ctx context.Context) {
 				metrics_updater.RecordFailedInPlaceUpdate(vpaSize, vpa.Name, vpa.Namespace, "InPlaceUpdateRateLimiterWaitFailed")
 				return
 			}
-			err := inPlaceLimiter.InPlaceUpdate(pod, vpa, u.eventRecorder)
+			if update.ExternalOOM && vpa_api_util.PrepareExternalOOMUpdate(actionVPA, pod, actionVPA.Status.Recommendation, update.ExternalOOMSignals, time.Now()) == nil {
+				continue
+			}
+			err := inPlaceLimiter.InPlaceUpdate(pod, actionVPA, u.eventRecorder)
 			if err != nil {
 				reason := "InPlaceUpdateError"
 				// For InPlace mode, don't evict pods even if we get an error
-				if updateMode == vpa_types.UpdateModeInPlace {
+				if updateMode == vpa_types.UpdateModeInPlace || update.ExternalOOM {
 					if isInfeasibleError(err) {
 						reason = "InPlaceUpdateInfeasible"
-						u.recordInfeasibleAttempt(pod, vpa)
+						u.recordInfeasibleAttempt(pod, actionVPA)
 					}
 					klog.V(0).InfoS("In-place resize failed", "error", err, "pod", klog.KObj(pod), "reason", reason)
 					metrics_updater.RecordFailedInPlaceUpdate(vpaSize, vpa.Name, vpa.Namespace, reason)
@@ -683,8 +703,9 @@ func getRateLimiter(rateLimit float64, rateLimitBurst int) *rate.Limiter {
 }
 
 // getPodsUpdateOrder returns list of pods that should be updated ordered by update priority
-func (u *updater) getPodsUpdateOrder(pods []*corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) []*corev1.Pod {
+func (u *updater) getPodsUpdateOrder(pods []*corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) []priority.PodUpdate {
 	updateconfig := priority.UpdateConfig{
+		ExternalOOMSignals:         u.externalOOMSignals[vpa.UID],
 		MinChangePriority:          u.defaultUpdateThreshold,
 		PodLifetimeUpdateThreshold: u.podLifetimeUpdateThreshold,
 		EvictAfterOOMThreshold:     u.evictAfterOOMThreshold,
@@ -699,7 +720,7 @@ func (u *updater) getPodsUpdateOrder(pods []*corev1.Pod, vpa *vpa_types.Vertical
 		priorityCalculator.AddPod(pod, time.Now(), u.infeasibleAttempts)
 	}
 
-	return priorityCalculator.GetSortedPods(u.evictionAdmission)
+	return priorityCalculator.GetSortedPodUpdates(u.evictionAdmission)
 }
 
 func filterPods(pods []*corev1.Pod, predicate func(*corev1.Pod) bool) []*corev1.Pod {

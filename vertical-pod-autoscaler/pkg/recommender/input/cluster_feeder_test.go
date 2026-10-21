@@ -1242,14 +1242,18 @@ func TestApplyPendingBackfillsNoopWhenDisabled(t *testing.T) {
 // goroutine can be exercised without a live Prometheus. release, when set,
 // holds the fetch open until the test closes it.
 type stubHistoryProvider struct {
-	release <-chan struct{}
-	hist    map[model.PodID]*history.PodHistory
-	err     error
+	returned chan struct{}
+	release  <-chan struct{}
+	hist     map[model.PodID]*history.PodHistory
+	err      error
 }
 
 func (s *stubHistoryProvider) GetVPAHistory(_ context.Context, _ model.VpaID, _ map[string]string) (map[model.PodID]*history.PodHistory, error) {
 	if s.release != nil {
 		<-s.release
+	}
+	if s.returned != nil {
+		close(s.returned)
 	}
 	return s.hist, s.err
 }
@@ -1316,14 +1320,28 @@ func TestHistoryBackfillFetchErrorSendsNothing(t *testing.T) {
 	feeder, clusterState, vpaID := makeBackfillFeeder(t, map[string]string{
 		annotations.HistoryQueryCPUAnnotation: "some_metric{}",
 	})
-	feeder.perVPABackfiller = &stubHistoryProvider{err: errors.New("prometheus down")}
+	// A single slot lets the test synchronize with the worker's release.
+	feeder.backfillSem = make(chan struct{}, 1)
+	returned := make(chan struct{})
+	feeder.perVPABackfiller = &stubHistoryProvider{err: errors.New("prometheus down"), returned: returned}
 
 	feeder.maybeStartHistoryBackfill(vpaID)
 
-	// The worker holds a semaphore slot until it returns; draining it back to
-	// empty proves the goroutine finished without sending.
-	require.Eventually(t, func() bool { return len(feeder.backfillSem) == 0 },
-		10*time.Second, 5*time.Millisecond)
+	// First prove that the worker acquired its semaphore slot and called the
+	// provider. An initially empty semaphore does not prove it has finished.
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("backfill provider was never called")
+	}
+	// Taking the only slot synchronizes with the worker's release after error
+	// logging. Observing len(channel) alone has no happens-before relationship.
+	select {
+	case feeder.backfillSem <- struct{}{}:
+		<-feeder.backfillSem
+	case <-time.After(10 * time.Second):
+		t.Fatal("backfill worker never released its semaphore")
+	}
 	assert.Empty(t, feeder.backfillResults)
 
 	feeder.applyPendingBackfills()

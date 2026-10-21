@@ -22,6 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
@@ -31,9 +32,16 @@ import (
 
 // OomInfo contains data of the OOM event occurrence
 type OomInfo struct {
-	Timestamp   time.Time
-	Memory      model.ResourceAmount
-	ContainerID model.ContainerID
+	// External observations carry provenance for the advisory updater Event.
+	// Empty PodUID leaves legacy observations on the histogram-only path.
+	Metric        string
+	VpaUID        types.UID
+	VpaID         model.VpaID
+	VpaGeneration int64
+	PodUID        types.UID
+	Timestamp     time.Time
+	Memory        model.ResourceAmount
+	ContainerID   model.ContainerID
 }
 
 // Observer can observe pod resource update and collect OOM events.
