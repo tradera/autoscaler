@@ -82,6 +82,25 @@ admissionController webhook
 {{- end }}
 
 {{/*
+admissionController certManager
+*/}}
+{{- define "vertical-pod-autoscaler.admissionController.certManager.certName" -}}
+{{ include "vertical-pod-autoscaler.fullname" . }}-webhook-cert
+{{- end }}
+
+{{- define "vertical-pod-autoscaler.admissionController.certManager.issuerName" -}}
+{{ include "vertical-pod-autoscaler.fullname" . }}-selfsigned
+{{- end }}
+
+{{- define "vertical-pod-autoscaler.admissionController.certManager.caName" -}}
+{{ include "vertical-pod-autoscaler.fullname" . }}-webhook-ca
+{{- end }}
+
+{{- define "vertical-pod-autoscaler.admissionController.certManager.caIssuerName" -}}
+{{ include "vertical-pod-autoscaler.fullname" . }}-ca
+{{- end }}
+
+{{/*
 admissionController certGen
 */}}
 {{- define "vertical-pod-autoscaler.admissionController.certGen.fullname" -}}
@@ -155,4 +174,21 @@ app.kubernetes.io/component: recommender
 
 {{- define "vertical-pod-autoscaler.recommender.image" -}}
 {{- printf "%s:%s" .Values.recommender.image.repository (default .Chart.AppVersion .Values.recommender.image.tag) }}
+{{- end }}
+
+
+{{/*
+extraObjects
+*/}}
+
+{{/*
+Render one extraObjects entry: a string is evaluated as a template as-is, a map is converted to YAML first.
+The context must be the root context ($) so that tpl can resolve .Release, .Values and the named templates.
+*/}}
+{{- define "vertical-pod-autoscaler.tplvalues.render" -}}
+{{- if typeIs "string" .value -}}
+{{- tpl .value .context -}}
+{{- else -}}
+{{- tpl (.value | toYaml) .context -}}
+{{- end -}}
 {{- end }}

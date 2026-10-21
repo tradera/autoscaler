@@ -1,6 +1,3 @@
-{{- if and .Values.admissionController.registerWebhook .Values.admissionController.certGen.enabled }}
-{{- fail "admissionController.registerWebhook and admissionController.certGen.enabled cannot both be true. Choose either application-managed webhook (registerWebhook: true) or Helm-managed webhook with certGen (certGen.enabled: true)." -}}
-{{- end -}}
 {{- if .Values.admissionController.enabled -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,7 +15,7 @@ spec:
   replicas: {{ . }}
   {{- end }}
   revisionHistoryLimit: {{ .Values.admissionController.revisionHistoryLimit }}
-  {{- with .Values.admissionController.updateStrategy }}
+  {{- with (.Values.admissionController.strategy | default .Values.admissionController.updateStrategy) }}
   strategy:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -58,6 +55,10 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.admissionController.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.admissionController.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
@@ -77,7 +78,6 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           args:
-            - --v=4
             - --stderrthreshold=info
           {{- if .Values.admissionController.registerWebhook }}
             - --register-webhook=true
@@ -85,6 +85,10 @@ spec:
             - --register-webhook=false
           {{- end }}
             - --webhook-service={{ .Values.admissionController.service.name }}
+            - --reload-cert=true
+          {{- with .Values.admissionController.logLevel }}
+            - --v={{ . }}
+          {{- end }}
           {{- with .Values.admissionController.extraArgs }}
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -110,7 +114,13 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           volumeMounts:
+            {{- if .Values.admissionController.certManager.enabled }}
+            - name: tls-certs
+              mountPath: /etc/tls-certs
+              readOnly: true
+            {{- else }}
             {{- toYaml .Values.admissionController.volumeMounts | nindent 12 }}
+            {{- end }}
           {{- with .Values.admissionController.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -120,5 +130,19 @@ spec:
             {{ toYaml . | nindent 12 | trim }}
           {{- end }}
       volumes:
+        {{- if .Values.admissionController.certManager.enabled }}
+        - name: tls-certs
+          secret:
+            defaultMode: 420
+            secretName: {{ include "vertical-pod-autoscaler.admissionController.tls.secretName" . }}
+            items:
+              - key: ca.crt
+                path: caCert.pem
+              - key: tls.crt
+                path: serverCert.pem
+              - key: tls.key
+                path: serverKey.pem
+        {{- else }}
         {{- toYaml .Values.admissionController.volumes | nindent 8 }}
+        {{- end }}
 {{- end -}}

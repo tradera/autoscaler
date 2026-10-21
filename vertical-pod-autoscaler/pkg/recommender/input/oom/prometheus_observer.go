@@ -36,7 +36,7 @@ import (
 // needs. Defined locally so tests can stub it without implementing the full
 // prometheusv1.API surface.
 type promQueryAPI interface {
-	Query(ctx context.Context, query string, ts time.Time, opts ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, error)
+	Query(ctx context.Context, query string, ts time.Time, opts ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, prometheusv1.Infos, error)
 }
 
 // clusterStateView is the slice of model.ClusterState the observer reads.
@@ -190,7 +190,7 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 		o.podLabel, o.containerLabel, selector,
 	)
 
-	val, warns, err := o.promAPI.Query(queryCtx, query, time.Now())
+	val, warns, _, err := o.promAPI.Query(queryCtx, query, time.Now())
 	if err != nil {
 		// State is preserved on query failure: the next successful poll
 		// computes against the last-known value, so transient Prometheus

@@ -60,7 +60,7 @@ func (s podMetricsSource) List(ctx context.Context, namespace string, opts metav
 // Defined locally so tests can stub it without implementing the full
 // prometheusv1.API surface.
 type promQueryAPI interface {
-	Query(ctx context.Context, query string, ts time.Time, opts ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, error)
+	Query(ctx context.Context, query string, ts time.Time, opts ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, prometheusv1.Infos, error)
 }
 
 // clusterStateView is the slice of model.ClusterState this client reads.
@@ -171,7 +171,7 @@ func (s *prometheusMetricsClient) appendVPASamples(ctx context.Context, vpa *mod
 		)
 
 		queryCtx, cancel := context.WithTimeout(ctx, s.options.QueryTimeout)
-		val, warns, err := s.promAPI.Query(queryCtx, query, time.Now())
+		val, warns, _, err := s.promAPI.Query(queryCtx, query, time.Now())
 		cancel()
 		if err != nil {
 			klog.V(2).InfoS("Prometheus metrics query failed", "vpa", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName), "resource", res, "err", err)

@@ -21,7 +21,6 @@ limitations under the License.
 package v1beta1
 
 import (
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -118,7 +117,7 @@ func (in *CapacityBufferSpec) DeepCopyInto(out *CapacityBufferSpec) {
 		*out = new(ResourceList)
 		if **in != nil {
 			in, out := *in, *out
-			*out = make(map[ResourceName]resource.Quantity, len(*in))
+			*out = make(ResourceList, len(*in))
 			for key, val := range *in {
 				(*out)[key] = val.DeepCopy()
 			}
@@ -164,6 +163,11 @@ func (in *CapacityBufferStatus) DeepCopyInto(out *CapacityBufferStatus) {
 	if in.ProvisioningStrategy != nil {
 		in, out := &in.ProvisioningStrategy, &out.ProvisioningStrategy
 		*out = new(string)
+		**out = **in
+	}
+	if in.ReadyReplicas != nil {
+		in, out := &in.ReadyReplicas, &out.ReadyReplicas
+		*out = new(int32)
 		**out = **in
 	}
 }

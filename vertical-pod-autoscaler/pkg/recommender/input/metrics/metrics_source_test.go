@@ -41,15 +41,15 @@ type fakePromAPI struct {
 	calls   []string
 }
 
-func (f *fakePromAPI) Query(_ context.Context, query string, _ time.Time, _ ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, error) {
+func (f *fakePromAPI) Query(_ context.Context, query string, _ time.Time, _ ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, prometheusv1.Infos, error) {
 	f.calls = append(f.calls, query)
 	if f.err != nil {
-		return nil, nil, f.err
+		return nil, nil, nil, f.err
 	}
 	if v, ok := f.results[query]; ok {
-		return v, nil, nil
+		return v, nil, nil, nil
 	}
-	return prommodel.Vector{}, nil, nil
+	return prommodel.Vector{}, nil, nil, nil
 }
 
 type fakeClusterState struct {

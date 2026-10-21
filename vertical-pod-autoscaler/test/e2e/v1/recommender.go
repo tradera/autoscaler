@@ -30,12 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/autoscaler/vertical-pod-autoscaler/e2e/utils"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/test/e2e/utils"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	klog "k8s.io/klog/v2"
@@ -280,6 +280,61 @@ var _ = utils.RecommenderE2eDescribe("VPA CRD object", func() {
 			}
 		}
 		gomega.Expect(changeDetected).To(gomega.Equal(true))
+	})
+
+	f.It("is loaded correctly on recommender restart", framework.WithSerial(), framework.WithSlow(), func() {
+		ns := f.Namespace.Name
+
+		ginkgo.By("Waiting for a populated checkpoint to be created")
+		var checkpoint *vpa_types.VerticalPodAutoscalerCheckpoint
+		err := wait.PollUntilContextTimeout(context.Background(), utils.PollInterval, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+			list, err := vpaClientSet.AutoscalingV1().VerticalPodAutoscalerCheckpoints(ns).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				klog.ErrorS(err, "Error listing VPA checkpoints")
+				return false, err
+			}
+			for i := range list.Items {
+				if list.Items[i].Spec.VPAObjectName == vpaCRD.Name && !list.Items[i].Status.FirstSampleStart.IsZero() {
+					checkpoint = &list.Items[i]
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		firstSampleStart := checkpoint.Status.FirstSampleStart
+		lastUpdateTime := checkpoint.Status.LastUpdateTime
+		totalSamplesCount := checkpoint.Status.TotalSamplesCount
+
+		ginkgo.By("Deleting recommender")
+		gomega.Expect(deleteRecommender(f.ClientSet)).To(gomega.BeNil())
+
+		ginkgo.By("Waiting for the checkpoint to be updated after restart")
+		var updatedCheckpoint *vpa_types.VerticalPodAutoscalerCheckpoint
+		err = wait.PollUntilContextTimeout(context.Background(), utils.PollInterval, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+			c, err := vpaClientSet.AutoscalingV1().VerticalPodAutoscalerCheckpoints(ns).Get(ctx, checkpoint.Name, metav1.GetOptions{})
+			if err != nil {
+				klog.ErrorS(err, "Error getting VPA checkpoint")
+				return false, nil
+			}
+			if !c.Status.LastUpdateTime.After(lastUpdateTime.Time) {
+				return false, nil
+			}
+			updatedCheckpoint = c
+			return true, nil
+		})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+		ginkgo.By("Checking that firstSampleStart hasn't changed")
+		gomega.Expect(updatedCheckpoint.Status.FirstSampleStart.Equal(&firstSampleStart)).To(gomega.BeTrue(),
+			fmt.Sprintf("firstSampleStart changed after recommender restart: was %v, now %v",
+				firstSampleStart, updatedCheckpoint.Status.FirstSampleStart))
+
+		ginkgo.By("Checking that totalSamplesCount has increased")
+		gomega.Expect(updatedCheckpoint.Status.TotalSamplesCount).To(gomega.BeNumerically(">", totalSamplesCount),
+			fmt.Sprintf("totalSamplesCount should have increased after recommender restart: was %d, now %d",
+				totalSamplesCount, updatedCheckpoint.Status.TotalSamplesCount))
 	})
 })
 

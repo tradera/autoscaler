@@ -20,9 +20,46 @@ set -o pipefail
 
 SCRIPT_ROOT=$(dirname "${BASH_SOURCE}")/..
 BASE_NAME=$(basename "$0")
-source "${SCRIPT_ROOT}/hack/lib/util.sh"
 
-ARCH=$(kube::util::host_arch)
+get_host_arch() {
+  local host_arch
+  case "$(uname -m)" in
+    x86_64*)
+      host_arch=amd64
+      ;;
+    i?86_64*)
+      host_arch=amd64
+      ;;
+    amd64*)
+      host_arch=amd64
+      ;;
+    aarch64*)
+      host_arch=arm64
+      ;;
+    arm64*)
+      host_arch=arm64
+      ;;
+    arm*)
+      host_arch=arm
+      ;;
+    i?86*)
+      host_arch=x86
+      ;;
+    s390x*)
+      host_arch=s390x
+      ;;
+    ppc64le*)
+      host_arch=ppc64le
+      ;;
+    *)
+      echo "Unsupported host arch. Must be x86_64, 386, arm, arm64, s390x or ppc64le."
+      exit 1
+      ;;
+  esac
+  echo "${host_arch}"
+}
+
+ARCH=$(get_host_arch)
 
 function print_help {
   echo "ERROR! Usage: $BASE_NAME [suite]*"
@@ -37,6 +74,7 @@ function print_help {
   echo "Environment variables:"
   echo "  REGISTRY           - Container image registry (default: localhost:5001)"
   echo "  TAG                - Container image tag (default: latest)"
+  echo "  PULL_IMAGES        - Pull images from the registry instead of building them locally (default: false)"
   echo "  FEATURE_GATES      - Comma-separated list of feature gates to enable"
   echo "  EXTRA_HELM_VALUES  - Path to an additional Helm values file to use during installation"
 }
@@ -82,20 +120,21 @@ helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
 helm repo update metrics-server
 helm upgrade --install --set args={--kubelet-insecure-tls} metrics-server metrics-server/metrics-server --namespace kube-system --version 3.13.0 --wait
 
-# Build and load Docker images for each component
+# Build (or pull) and load Docker images for each component
 for COMPONENT in ${COMPONENTS}; do
-  ALL_ARCHITECTURES=${ARCH} make --directory "${SCRIPT_ROOT}/pkg/${COMPONENT}" docker-build REGISTRY="${REGISTRY}" TAG="${TAG}"
-  docker tag "${REGISTRY}/vpa-${COMPONENT}-${ARCH}:${TAG}" "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
+  if [ "${PULL_IMAGES:-false}" == "true" ]; then
+    docker pull "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
+  else
+    ALL_ARCHITECTURES=${ARCH} make --directory "${SCRIPT_ROOT}/pkg/${COMPONENT}" docker-build REGISTRY="${REGISTRY}" TAG="${TAG}"
+    docker tag "${REGISTRY}/vpa-${COMPONENT}-${ARCH}:${TAG}" "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
+  fi
   kind load docker-image "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
 done
 
 
 
-# Prepare Helm values
-HELM_CHART_PATH="${SCRIPT_ROOT}/charts/vertical-pod-autoscaler"
-VALUES_FILE="${SCRIPT_ROOT}/hack/e2e/values-e2e-local.yaml"
-HELM_RELEASE_NAME="vpa"
-HELM_NAMESPACE="kube-system"
+# Prepare Helm values (shared with deploy-for-e2e.sh via helm-settings.sh)
+source "${SCRIPT_ROOT}/hack/e2e/helm-settings.sh"
 
 # Build dynamic Helm set arguments based on components
 HELM_SET_ARGS=()
@@ -253,5 +292,6 @@ helm upgrade --install ${HELM_RELEASE_NAME} "${HELM_CHART_PATH}" \
   --namespace ${HELM_NAMESPACE} \
   --values "${VALUES_FILE}" \
   "${HELM_SET_ARGS[@]}" \
+  --debug \
   --wait \
   --timeout 15m

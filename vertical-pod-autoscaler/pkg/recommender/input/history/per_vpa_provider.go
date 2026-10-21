@@ -61,7 +61,7 @@ type PerVPAProviderOpts struct {
 // perVPAQueryAPI is the slice of prometheusv1.API this provider uses.
 // Defined locally so tests can stub it.
 type perVPAQueryAPI interface {
-	QueryRange(ctx context.Context, query string, r prometheusv1.Range, opts ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, error)
+	QueryRange(ctx context.Context, query string, r prometheusv1.Range, opts ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, prometheusv1.Infos, error)
 }
 
 // NewPerVPAProvider constructs a PerVPAProvider.
@@ -104,7 +104,7 @@ func (p *PerVPAProvider) readQueryRange(ctx context.Context, out map[model.PodID
 
 	end := time.Now()
 	start := end.Add(-p.opts.HistoryDuration)
-	result, _, err := p.api.QueryRange(queryCtx, query, prometheusv1.Range{
+	result, _, _, err := p.api.QueryRange(queryCtx, query, prometheusv1.Range{
 		Start: start,
 		End:   end,
 		Step:  p.opts.HistoryResolution,

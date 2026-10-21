@@ -1,0 +1,39 @@
+name: VPA Helm Unit Tests
+
+on:
+  push:
+    paths:
+      - 'vertical-pod-autoscaler/charts/**'
+      - '.github/workflows/vpa-helm-unittest.yaml'
+  pull_request:
+    paths:
+      - 'vertical-pod-autoscaler/charts/**'
+      - '.github/workflows/vpa-helm-unittest.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  helm-unittest:
+    name: Run Helm unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Not needed: this job only reads the repo and never pushes, so don't
+          # leave the GITHUB_TOKEN on disk for later steps.
+          persist-credentials: false
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Set up helm-unittest
+        run: |
+          archive="${RUNNER_TEMP}/unittest-1.2.0.tgz"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/helm-unittest/helm-unittest/releases/download/v1.2.0/unittest-1.2.0.tgz \
+            --output "$archive"
+          # Check the pinned release digest before Helm runs any bundled code.
+          echo "20b0ad5bf5d594dbd8edffd99b5cd8ebb36e084406386cb280e776186d7aed04  $archive" | sha256sum --check
+          helm plugin install "$archive" --verify=false
+      - name: Run Helm unit tests for VPA
+        run: helm unittest vertical-pod-autoscaler/charts/vertical-pod-autoscaler

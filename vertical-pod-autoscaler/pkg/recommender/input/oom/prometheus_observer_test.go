@@ -37,19 +37,19 @@ type fakeAPI struct {
 	err     error
 }
 
-func (f *fakeAPI) Query(_ context.Context, _ string, _ time.Time, _ ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, error) {
+func (f *fakeAPI) Query(_ context.Context, _ string, _ time.Time, _ ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, prometheusv1.Infos, error) {
 	f.calls++
 	if f.err != nil {
-		return nil, nil, f.err
+		return nil, nil, nil, f.err
 	}
 	if len(f.results) == 0 {
-		return prommodel.Vector{}, nil, nil
+		return prommodel.Vector{}, nil, nil, nil
 	}
 	v := f.results[0]
 	if len(f.results) > 1 {
 		f.results = f.results[1:]
 	}
-	return v, nil, nil
+	return v, nil, nil, nil
 }
 
 // fakeClusterState implements just the slice of ClusterState the observer

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,16 +33,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes/fake"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	core "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	fakeautoscalingv1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/autoscaling.k8s.io/v1/fake"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/metrics"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/oom"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/spec"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
@@ -113,6 +115,24 @@ func (cs *fakeClusterState) AddSample(sample *model.ContainerUsageSampleWithKey)
 
 func (cs *fakeClusterState) AddOrUpdatePod(podID model.PodID, _ labels.Set, _ corev1.PodPhase) {
 	cs.addedPods = append(cs.addedPods, podID)
+	if cs.stubbedPods == nil {
+		cs.stubbedPods = make(map[model.PodID]*model.PodState)
+	}
+	if cs.stubbedPods[podID] == nil {
+		cs.stubbedPods[podID] = &model.PodState{
+			ID:         podID,
+			Containers: make(map[string]*model.ContainerState),
+		}
+	}
+}
+
+func (cs *fakeClusterState) SetInitContainers(podID model.PodID, initContainers []string) error {
+	pod, podExists := cs.stubbedPods[podID]
+	if !podExists || pod == nil {
+		return model.NewKeyError(podID)
+	}
+	pod.InitContainers = append([]string(nil), initContainers...)
+	return nil
 }
 
 func (cs *fakeClusterState) Pods() map[model.PodID]*model.PodState {
@@ -123,7 +143,7 @@ func (cs *fakeClusterState) VPAs() map[model.VpaID]*model.Vpa {
 	return cs.stubbedVPAs
 }
 
-func (cs *fakeClusterState) StateMapSize() int {
+func (*fakeClusterState) StateMapSize() int {
 	return 0
 }
 
@@ -488,6 +508,51 @@ func TestClusterStateFeeder_LoadPods_ContainerTracking(t *testing.T) {
 	assert.Equal(t, len(feeder.clusterState.Pods()[podWithInitContainersID].InitContainers), 2)
 	assert.Equal(t, len(feeder.clusterState.Pods()[podWithoutInitContainersID].Containers), 2)
 	assert.Equal(t, len(feeder.clusterState.Pods()[podWithoutInitContainersID].InitContainers), 0)
+
+	// Re-loading the same pods must not cause the init container list to grow.
+	// This guards against a regression where LoadPods appended to the existing
+	// slice on every invocation, leading to unbounded growth over time.
+	feeder.LoadPods()
+	feeder.LoadPods()
+
+	assert.Equal(t, len(feeder.clusterState.Pods()), 2)
+	assert.Equal(t, len(feeder.clusterState.Pods()[podWithInitContainersID].InitContainers), 2)
+	assert.ElementsMatch(t,
+		[]string{"init1", "init2"},
+		feeder.clusterState.Pods()[podWithInitContainersID].InitContainers,
+	)
+	assert.Equal(t, len(feeder.clusterState.Pods()[podWithoutInitContainersID].InitContainers), 0)
+}
+
+func TestClusterStateFeeder_LoadPods_PodDeletion(t *testing.T) {
+	pod1ID := model.PodID{Namespace: "default", PodName: "Pod1"}
+	pod1 := newTestPodSpec(pod1ID, nil, nil)
+	pod2ID := model.PodID{Namespace: "default", PodName: "Pod2"}
+	pod2 := newTestPodSpec(pod2ID, nil, nil)
+
+	client := &testSpecClient{pods: []*spec.BasicPodSpec{pod1, pod2}}
+	clusterState := model.NewClusterState(testGcPeriod)
+
+	feeder := clusterStateFeeder{
+		specClient:     client,
+		memorySaveMode: false,
+		clusterState:   clusterState,
+	}
+
+	feeder.LoadPods()
+	assert.Len(t, feeder.clusterState.Pods(), 2)
+
+	client.pods = []*spec.BasicPodSpec{pod1}
+	feeder.LoadPods()
+
+	// Since deletion is shifted, pod2 should still exist in clusterState.
+	assert.Len(t, feeder.clusterState.Pods(), 2)
+	assert.Contains(t, feeder.clusterState.Pods(), pod2ID)
+
+	feeder.DeleteRemovedPods()
+	// Now pod2 should be deleted.
+	assert.Len(t, feeder.clusterState.Pods(), 1)
+	assert.NotContains(t, feeder.clusterState.Pods(), pod2ID)
 }
 
 func TestClusterStateFeeder_ReconcileOOMsFromPodState(t *testing.T) {
@@ -744,6 +809,95 @@ func TestClusterStateFeeder_LoadRealTimeMetrics(t *testing.T) {
 	assert.False(t, samplesForExtraContainerExist)
 }
 
+func TestClusterStateFeeder_LoadRealTimeMetrics_OOMEventsWithDeletedPods(t *testing.T) {
+	_, tctx := ktesting.NewTestContext(t)
+	pod1ID := model.PodID{Namespace: "default", PodName: "Pod1"}
+	pod2ID := model.PodID{Namespace: "default", PodName: "Pod2"}
+
+	containerSpecs1 := []spec.BasicContainerSpec{
+		newTestContainerSpec(pod1ID, "containerA", 500, 512*1024*1024),
+	}
+	pod1 := newTestPodSpec(pod1ID, containerSpecs1, nil)
+
+	containerSpecs2 := []spec.BasicContainerSpec{
+		newTestContainerSpec(pod2ID, "containerB", 500, 512*1024*1024),
+	}
+	pod2 := newTestPodSpec(pod2ID, containerSpecs2, nil)
+
+	client := &testSpecClient{pods: []*spec.BasicPodSpec{pod1, pod2}}
+	clusterState := model.NewClusterState(testGcPeriod)
+	oomChan := make(chan oom.OomInfo, 10)
+
+	feeder := clusterStateFeeder{
+		specClient:     client,
+		memorySaveMode: false,
+		clusterState:   clusterState,
+		oomChan:        oomChan,
+		metricsClient:  fakeMetricsClient{snapshots: nil},
+	}
+
+	// Add two pods to the clusterState.
+	feeder.LoadPods()
+	assert.Len(t, feeder.clusterState.Pods(), 2)
+
+	// Add OOM events for both pods to the oomChan.
+	timestamp1 := time.Now()
+	oomChan <- oom.OomInfo{
+		Timestamp:   timestamp1,
+		Memory:      model.ResourceAmount(1024 * 1024 * 1024),
+		ContainerID: model.ContainerID{PodID: pod1ID, ContainerName: "containerA"},
+	}
+	oomChan <- oom.OomInfo{
+		Timestamp:   timestamp1,
+		Memory:      model.ResourceAmount(1024 * 1024 * 1024),
+		ContainerID: model.ContainerID{PodID: pod2ID, ContainerName: "containerB"},
+	}
+
+	feeder.LoadRealTimeMetrics(tctx)
+
+	// Asserting both OomInfo has been processed.
+	c1State := feeder.clusterState.GetContainer(model.ContainerID{PodID: pod1ID, ContainerName: "containerA"})
+	c2State := feeder.clusterState.GetContainer(model.ContainerID{PodID: pod2ID, ContainerName: "containerB"})
+	assert.NotNil(t, c1State)
+	assert.NotNil(t, c2State)
+	assert.Greater(t, int64(c1State.GetMaxMemoryPeak()), int64(0))
+	assert.Greater(t, int64(c2State.GetMaxMemoryPeak()), int64(0))
+
+	// Add new higher memory OOM events to oomChan for both pods
+	timestamp2 := timestamp1.Add(time.Minute)
+	oomChan <- oom.OomInfo{
+		Timestamp:   timestamp2,
+		Memory:      model.ResourceAmount(2048 * 1024 * 1024),
+		ContainerID: model.ContainerID{PodID: pod1ID, ContainerName: "containerA"},
+	}
+	oomChan <- oom.OomInfo{
+		Timestamp:   timestamp2,
+		Memory:      model.ResourceAmount(2048 * 1024 * 1024),
+		ContainerID: model.ContainerID{PodID: pod2ID, ContainerName: "containerB"},
+	}
+
+	// Remove pod2 from spec client, simulating its eviction.
+	client.pods = []*spec.BasicPodSpec{pod1}
+	feeder.LoadPods()
+
+	// Pod2 should still exist in clusterState.
+	assert.Len(t, feeder.clusterState.Pods(), 2)
+	assert.Contains(t, feeder.clusterState.Pods(), pod2ID)
+
+	peak1Before := c1State.GetMaxMemoryPeak()
+	peak2Before := c2State.GetMaxMemoryPeak()
+
+	// Load Real-time metrics. OomInfo of Pod2 must be processed.
+	feeder.LoadRealTimeMetrics(tctx)
+	assert.Greater(t, int64(c1State.GetMaxMemoryPeak()), int64(peak1Before))
+	assert.Greater(t, int64(c2State.GetMaxMemoryPeak()), int64(peak2Before))
+
+	// Call DeleteRemovedPods to delete pod2.
+	feeder.DeleteRemovedPods()
+	assert.Len(t, feeder.clusterState.Pods(), 1)
+	assert.NotContains(t, feeder.clusterState.Pods(), pod2ID)
+}
+
 type fakeHistoryProvider struct {
 	history map[model.PodID]*history.PodHistory
 	err     error
@@ -924,11 +1078,7 @@ func TestFilterVPAsIgnoreNamespaces(t *testing.T) {
 
 func TestCanCleanupCheckpoints(t *testing.T) {
 	_, tctx := ktesting.NewTestContext(t)
-	client := fake.NewClientset()
 	namespace := "testNamespace"
-
-	_, err := client.CoreV1().Namespaces().Create(tctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{})
-	assert.NoError(t, err)
 
 	vpaBuilder := test.VerticalPodAutoscaler().WithContainer("container").WithNamespace(namespace).WithTargetRef(&autoscalingv1.CrossVersionObjectReference{
 		Kind:       kind,
@@ -978,16 +1128,11 @@ func TestCanCleanupCheckpoints(t *testing.T) {
 		return true, nil, nil
 	})
 
-	// Create namespace lister mock that will return the checkpoint list
-	checkpointNamespaceLister := &test.VerticalPodAutoscalerCheckPointListerMock{}
-	checkpointNamespaceLister.On("List").Return(vpacheckpoints, nil)
-
-	// Create main checkpoint mock that will return the namespace lister
+	// Create checkpoint lister mock that will return the checkpoint list
 	checkpointLister := &test.VerticalPodAutoscalerCheckPointListerMock{}
-	checkpointLister.On("VerticalPodAutoscalerCheckpoints", namespace).Return(checkpointNamespaceLister)
+	checkpointLister.On("List").Return(vpacheckpoints, nil)
 
 	feeder := clusterStateFeeder{
-		coreClient:          client.CoreV1(),
 		vpaLister:           vpaLister,
 		vpaCheckpointClient: checkpointClient,
 		vpaCheckpointLister: checkpointLister,
@@ -995,7 +1140,8 @@ func TestCanCleanupCheckpoints(t *testing.T) {
 		recommenderName:     "default",
 	}
 
-	feeder.GarbageCollectCheckpoints(tctx)
+	err := feeder.GarbageCollectCheckpoints(tctx)
+	assert.NoError(t, err)
 
 	assert.Contains(t, deletedCheckpoints, "nonExistentVPA")
 
@@ -1193,4 +1339,167 @@ func TestHistoryBackfillSkipsVPAWithoutAnnotations(t *testing.T) {
 
 	assert.NotContains(t, feeder.backfilledVPAs, vpaID)
 	assert.Empty(t, feeder.backfillResults)
+}
+
+func TestInitFromCheckpoints(t *testing.T) {
+	const containerName = "container"
+	firstSampleStart := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	newVpa := func(vpaNamespace, vpaName string, recommender string) *vpa_types.VerticalPodAutoscaler {
+		builder := test.VerticalPodAutoscaler().WithName(vpaName).WithNamespace(vpaNamespace).WithContainer(containerName).WithTargetRef(&autoscalingv1.CrossVersionObjectReference{
+			Kind:       kind,
+			Name:       name1,
+			APIVersion: apiVersion,
+		})
+		if recommender != "" {
+			builder = builder.WithRecommender(recommender)
+		}
+		return builder.Get()
+	}
+	newCheckpoint := func(vpaNamespace, vpaName string, totalSamplesCount int, version string) *vpa_types.VerticalPodAutoscalerCheckpoint {
+		return &vpa_types.VerticalPodAutoscalerCheckpoint{
+			ObjectMeta: metav1.ObjectMeta{Namespace: vpaNamespace, Name: vpaName + "-" + containerName},
+			Spec:       vpa_types.VerticalPodAutoscalerCheckpointSpec{VPAObjectName: vpaName, ContainerName: containerName},
+			Status: vpa_types.VerticalPodAutoscalerCheckpointStatus{
+				Version:           version,
+				TotalSamplesCount: totalSamplesCount,
+				FirstSampleStart:  metav1.NewTime(firstSampleStart),
+				LastSampleStart:   metav1.NewTime(firstSampleStart.Add(time.Hour)),
+			},
+		}
+	}
+
+	testCases := []struct {
+		name              string
+		recommenderName   string
+		ignoredNamespaces []string
+		vpas              []*vpa_types.VerticalPodAutoscaler
+		checkpoints       []*vpa_types.VerticalPodAutoscalerCheckpoint
+		expectedLoaded    map[model.VpaID]int
+		expectedErrors    int
+	}{
+		{
+			name:            "loads checkpoint of tracked VPA",
+			recommenderName: DefaultRecommenderName,
+			vpas:            []*vpa_types.VerticalPodAutoscaler{newVpa("ns1", "vpa1", "")},
+			checkpoints:     []*vpa_types.VerticalPodAutoscalerCheckpoint{newCheckpoint("ns1", "vpa1", 42, model.SupportedCheckpointVersion)},
+			expectedLoaded:  map[model.VpaID]int{{Namespace: "ns1", VpaName: "vpa1"}: 42},
+		},
+		{
+			name:            "loads each checkpoint into its own VPA across namespaces",
+			recommenderName: DefaultRecommenderName,
+			vpas:            []*vpa_types.VerticalPodAutoscaler{newVpa("ns1", "vpa1", ""), newVpa("ns2", "vpa1", "")},
+			checkpoints: []*vpa_types.VerticalPodAutoscalerCheckpoint{
+				newCheckpoint("ns1", "vpa1", 1, model.SupportedCheckpointVersion),
+				newCheckpoint("ns2", "vpa1", 2, model.SupportedCheckpointVersion),
+			},
+			expectedLoaded: map[model.VpaID]int{{Namespace: "ns1", VpaName: "vpa1"}: 1, {Namespace: "ns2", VpaName: "vpa1"}: 2},
+		},
+		{
+			name:            "skips checkpoint of VPA handled by another recommender",
+			recommenderName: DefaultRecommenderName,
+			vpas:            []*vpa_types.VerticalPodAutoscaler{newVpa("ns1", "vpa1", ""), newVpa("ns1", "vpa2", "other-recommender")},
+			checkpoints: []*vpa_types.VerticalPodAutoscalerCheckpoint{
+				newCheckpoint("ns1", "vpa1", 42, model.SupportedCheckpointVersion),
+				newCheckpoint("ns1", "vpa2", 7, model.SupportedCheckpointVersion),
+			},
+			expectedLoaded: map[model.VpaID]int{{Namespace: "ns1", VpaName: "vpa1"}: 42},
+		},
+		{
+			name:            "non-default recommender skips checkpoint of default recommender's VPA",
+			recommenderName: "other-recommender",
+			vpas:            []*vpa_types.VerticalPodAutoscaler{newVpa("ns1", "vpa1", ""), newVpa("ns1", "vpa2", "other-recommender")},
+			checkpoints: []*vpa_types.VerticalPodAutoscalerCheckpoint{
+				newCheckpoint("ns1", "vpa1", 42, model.SupportedCheckpointVersion),
+				newCheckpoint("ns1", "vpa2", 7, model.SupportedCheckpointVersion),
+			},
+			expectedLoaded: map[model.VpaID]int{{Namespace: "ns1", VpaName: "vpa2"}: 7},
+		},
+		{
+			name:            "skips orphaned checkpoint",
+			recommenderName: DefaultRecommenderName,
+			vpas:            []*vpa_types.VerticalPodAutoscaler{newVpa("ns1", "vpa1", "")},
+			checkpoints: []*vpa_types.VerticalPodAutoscalerCheckpoint{
+				newCheckpoint("ns1", "vpa1", 42, model.SupportedCheckpointVersion),
+				newCheckpoint("ns1", "vpa-orphaned", 7, model.SupportedCheckpointVersion),
+			},
+			expectedLoaded: map[model.VpaID]int{{Namespace: "ns1", VpaName: "vpa1"}: 42},
+		},
+		{
+			name:              "skips checkpoint in ignored namespace",
+			recommenderName:   DefaultRecommenderName,
+			ignoredNamespaces: []string{"ns-ignored"},
+			vpas:              []*vpa_types.VerticalPodAutoscaler{newVpa("ns1", "vpa1", ""), newVpa("ns-ignored", "vpa1", "")},
+			checkpoints: []*vpa_types.VerticalPodAutoscalerCheckpoint{
+				newCheckpoint("ns1", "vpa1", 42, model.SupportedCheckpointVersion),
+				newCheckpoint("ns-ignored", "vpa1", 7, model.SupportedCheckpointVersion),
+			},
+			expectedLoaded: map[model.VpaID]int{{Namespace: "ns1", VpaName: "vpa1"}: 42},
+		},
+		{
+			name:            "logs error for checkpoint of tracked VPA that cannot be loaded",
+			recommenderName: DefaultRecommenderName,
+			vpas:            []*vpa_types.VerticalPodAutoscaler{newVpa("ns1", "vpa1", "")},
+			checkpoints:     []*vpa_types.VerticalPodAutoscalerCheckpoint{newCheckpoint("ns1", "vpa1", 42, "invalidVersion")},
+			expectedLoaded:  map[model.VpaID]int{},
+			expectedErrors:  1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := ktesting.NewLogger(t, ktesting.NewConfig(ktesting.BufferLogs(true)))
+			klog.SetLogger(logger)
+			defer klog.ClearLogger()
+
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			vpaLister := &test.VerticalPodAutoscalerListerMock{}
+			vpaLister.On("List").Return(tc.vpas, nil)
+			checkpointLister := &test.VerticalPodAutoscalerCheckPointListerMock{}
+			checkpointLister.On("List").Return(tc.checkpoints, nil)
+			targetSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+			targetSelectorFetcher.EXPECT().Fetch(gomock.Any()).Return(parseLabelSelector("app = test"), nil).AnyTimes()
+
+			clusterState := model.NewClusterState(testGcPeriod)
+			feeder := clusterStateFeeder{
+				vpaLister:           vpaLister,
+				vpaCheckpointLister: checkpointLister,
+				clusterState:        clusterState,
+				selectorFetcher:     targetSelectorFetcher,
+				controllerFetcher:   &fakeControllerFetcher{},
+				recommenderName:     tc.recommenderName,
+				ignoredNamespaces:   tc.ignoredNamespaces,
+			}
+
+			feeder.InitFromCheckpoints(t.Context())
+
+			for id, expectedTotalSamplesCount := range tc.expectedLoaded {
+				vpa, found := clusterState.VPAs()[id]
+				if !assert.True(t, found, "VPA %v not in cluster state", id) {
+					continue
+				}
+				state, found := vpa.ContainersInitialAggregateState[containerName]
+				if !assert.True(t, found, "checkpoint not loaded for VPA %v", id) {
+					continue
+				}
+				assert.Equal(t, expectedTotalSamplesCount, state.TotalSamplesCount)
+				assert.True(t, firstSampleStart.Equal(state.FirstSampleStart), "unexpected FirstSampleStart %v for VPA %v", state.FirstSampleStart, id)
+			}
+			for id, vpa := range clusterState.VPAs() {
+				if _, expected := tc.expectedLoaded[id]; !expected {
+					assert.Empty(t, vpa.ContainersInitialAggregateState, "unexpected checkpoint loaded for VPA %v", id)
+				}
+			}
+
+			var errorLogs []string
+			for _, entry := range logger.GetSink().(ktesting.Underlier).GetBuffer().Data() {
+				if entry.Type == ktesting.LogError {
+					errorLogs = append(errorLogs, fmt.Sprintf("%s: %v", entry.Message, entry.Err))
+				}
+			}
+			assert.Len(t, errorLogs, tc.expectedErrors, "unexpected error log entries:\n%s", strings.Join(errorLogs, "\n"))
+		})
+	}
 }

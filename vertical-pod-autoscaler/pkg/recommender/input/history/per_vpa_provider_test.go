@@ -36,15 +36,15 @@ type fakeRangeAPI struct {
 	err     error
 }
 
-func (f *fakeRangeAPI) QueryRange(_ context.Context, query string, _ prometheusv1.Range, _ ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, error) {
+func (f *fakeRangeAPI) QueryRange(_ context.Context, query string, _ prometheusv1.Range, _ ...prometheusv1.Option) (prommodel.Value, prometheusv1.Warnings, prometheusv1.Infos, error) {
 	f.queries = append(f.queries, query)
 	if f.err != nil {
-		return nil, nil, f.err
+		return nil, nil, nil, f.err
 	}
 	if v, ok := f.results[query]; ok {
-		return v, nil, nil
+		return v, nil, nil, nil
 	}
-	return prommodel.Matrix{}, nil, nil
+	return prommodel.Matrix{}, nil, nil, nil
 }
 
 func newProvider(api perVPAQueryAPI) *PerVPAProvider {

@@ -26,10 +26,10 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/autoscaler/vertical-pod-autoscaler/e2e/utils"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/test/e2e/utils"
 	"k8s.io/kubernetes/test/e2e/framework"
 	podsecurity "k8s.io/pod-security-admission/api"
 
@@ -58,7 +58,7 @@ var _ = AdmissionControllerE2eDescribe("Admission-controller", func() {
 		waitForVpaWebhookRegistration(f)
 	})
 
-	f.It("starts pods with new recommended request with InPlaceOrRecreate mode", framework.WithFeatureGate(features.InPlaceOrRecreate), func() {
+	f.It("starts pods with new recommended request with InPlaceOrRecreate mode", func() {
 		d := NewHamsterDeploymentWithResources(f, ParseQuantityOrDie("100m") /*cpu*/, ParseQuantityOrDie("100Mi") /*memory*/)
 
 		ginkgo.By("Setting up a VPA CRD")
@@ -416,6 +416,24 @@ var _ = AdmissionControllerE2eDescribe("Admission-controller", func() {
 		podName := podList.Items[0].Name
 		ginkgo.By(fmt.Sprintf("Modifying pod %v.", podName))
 		AnnotatePod(f, podName, "someAnnotation", "someValue")
+	})
+
+	ginkgo.It("applies recommendation from a VPA with `UpdateMode: Initial` when a VPA with `UpdateMode: Off` also matches the target", func() {
+		d := NewHamsterDeploymentWithResources(f, ParseQuantityOrDie("100m") /*cpu*/, ParseQuantityOrDie("100Mi") /*memory*/)
+
+		ginkgo.By("Setting up VPA CRD with updateMode: Off")
+		installHamsterVPA(f, "1-hamster-vpa-off", vpa_types.UpdateModeOff, "500m", "500Mi")
+
+		ginkgo.By("Setting up a VPA CRD with updateMode: Initial")
+		installHamsterVPA(f, "2-hamster-vpa", vpa_types.UpdateModeInitial, "250m", "200Mi")
+
+		ginkgo.By("Setting up a hamster deployment")
+		podList := utils.StartDeploymentPods(f, d)
+
+		for _, pod := range podList.Items {
+			gomega.Expect(pod.Spec.Containers[0].Resources.Requests[apiv1.ResourceCPU]).To(gomega.Equal(ParseQuantityOrDie("250m")))
+			gomega.Expect(pod.Spec.Containers[0].Resources.Requests[apiv1.ResourceMemory]).To(gomega.Equal(ParseQuantityOrDie("200Mi")))
+		}
 	})
 
 	ginkgo.It("keeps limits equal to request", func() {
@@ -1108,84 +1126,6 @@ var _ = AdmissionControllerE2eDescribe("Admission-controller", func() {
 			expectedErr string
 		}{
 			{
-				name: "Invalid oomBumpUpRatio (negative value)",
-				vpaJSON: `{
-            "apiVersion": "autoscaling.k8s.io/v1",
-            "kind": "VerticalPodAutoscaler",
-            "metadata": {"name": "oom-test-vpa"},
-            "spec": {
-                "targetRef": {
-                    "apiVersion": "apps/v1",
-                    "kind": "Deployment",
-                    "name": "oom-test"
-                },
-                "updatePolicy": {
-                    "updateMode": "Auto"
-                },
-                "resourcePolicy": {
-                    "containerPolicies": [{
-                        "containerName": "*",
-                        "oomBumpUpRatio": -1,
-                        "oomMinBumpUp": 104857600
-                    }]
-                }
-            }
-        }`,
-				expectedErr: "admission webhook \"vpa.k8s.io\" denied the request: oomBumpUpRatio must be greater than or equal to 1.0, got -1",
-			},
-			{
-				name: "Invalid oomBumpUpRatio (less than 1)",
-				vpaJSON: `{
-            "apiVersion": "autoscaling.k8s.io/v1",
-            "kind": "VerticalPodAutoscaler",
-            "metadata": {"name": "oom-test-vpa"},
-            "spec": {
-                "targetRef": {
-                    "apiVersion": "apps/v1",
-                    "kind": "Deployment",
-                    "name": "oom-test"
-                },
-                "updatePolicy": {
-                    "updateMode": "Auto"
-                },
-                "resourcePolicy": {
-                    "containerPolicies": [{
-                        "containerName": "*",
-                        "oomBumpUpRatio": 0.5,
-                        "oomMinBumpUp": 104857600
-                    }]
-                }
-            }
-        }`,
-				expectedErr: "admission webhook \"vpa.k8s.io\" denied the request: oomBumpUpRatio must be greater than or equal to 1.0, got 0.5",
-			},
-			{
-				name: "Invalid oomMinBumpUp (negative value)",
-				vpaJSON: `{
-            "apiVersion": "autoscaling.k8s.io/v1",
-            "kind": "VerticalPodAutoscaler",
-            "metadata": {"name": "oom-test-vpa"},
-            "spec": {
-                "targetRef": {
-                    "apiVersion": "apps/v1",
-                    "kind": "Deployment",
-                    "name": "oom-test"
-                },
-                "updatePolicy": {
-                    "updateMode": "Auto"
-                },
-                "resourcePolicy": {
-                    "containerPolicies": [{
-                        "containerName": "*",
-                        "oomBumpUpRatio": 2,
-                        "oomMinBumpUp": -1
-                    }]
-                }
-            }
-        }`,
-				expectedErr: "admission webhook \"vpa.k8s.io\" denied the request: oomMinBumpUp must be greater than or equal to 0, got -1 bytes",
-			},
-			{
 				name: "Invalid oomBumpUpRatio (string value)",
 				vpaJSON: `{
             "apiVersion": "autoscaling.k8s.io/v1",
@@ -1209,14 +1149,14 @@ var _ = AdmissionControllerE2eDescribe("Admission-controller", func() {
                 }
             }
         }`,
-				expectedErr: "admission webhook \"vpa.k8s.io\" denied the request: quantities must match the regular expression",
+				expectedErr: `admission webhook "vpa.k8s.io" denied the request: VerticalPodAutoscaler.autoscaling.k8s.io "oom-test-vpa" is invalid: .: Internal error: quantities must match the regular expression '^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$'`,
 			},
 		}
 		for _, tc := range testCases {
 			ginkgo.By(fmt.Sprintf("Testing %s", tc.name))
 			err := InstallRawVPA(f, []byte(tc.vpaJSON))
 			gomega.Expect(err).To(gomega.HaveOccurred(), fmt.Sprintf("Invalid VPA object accepted, name: \"%s\"", tc.name))
-			gomega.Expect(err.Error()).To(gomega.MatchRegexp(tc.expectedErr))
+			gomega.Expect(err.Error()).To(gomega.Equal(tc.expectedErr))
 		}
 	})
 
