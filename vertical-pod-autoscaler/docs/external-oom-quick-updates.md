@@ -2,6 +2,14 @@
 
 The fork can use an application OOM counter to accelerate an in-place memory increase, even when the application catches the error and Kubernetes does not report `OOMKilled`.
 
+## Contents
+
+<!-- toc -->
+- [Requirements](#requirements)
+- [Behavior](#behavior)
+- [Observability and rollout](#observability-and-rollout)
+<!-- /toc -->
+
 ## Requirements
 
 - Install the updated VPA CRDs, recommender and updater from the same fork revision. Older CRDs prune the optional signal field; older updaters ignore it.
