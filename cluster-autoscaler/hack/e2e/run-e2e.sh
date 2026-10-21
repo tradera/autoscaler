@@ -43,12 +43,15 @@ gcloud auth configure-docker -q
 GIT_COMMIT="$(git describe --always --dirty --exclude '*')"
 TAG="dev-${GIT_COMMIT}-$(date +%s)"
 REGISTRY="gcr.io/$(gcloud config get core/project)"
-make -C "${CA_ROOT}" execute-release REGISTRY=${REGISTRY} TAG=${TAG}
-CA_IMAGE="${REGISTRY}/cluster-autoscaler:${TAG}"
+BUILD_TAGS="gce"
+make -C "${CA_ROOT}" execute-release REGISTRY=${REGISTRY} TAG=${TAG} BUILD_TAGS="${BUILD_TAGS}"
+CA_IMAGE="${REGISTRY}/cluster-autoscaler-${BUILD_TAGS}:${TAG}"
 
 echo "### STEP 1: Standard Autoscaling tests ###"
 ${CA_ROOT}/hack/e2e/deploy-ca-on-gce-for-e2e.sh "${CA_IMAGE}"
-${CA_ROOT}/hack/e2e/run-e2e-tests.sh "Standard Autoscaling${REMAINING_ARGS[0]:+.*${REMAINING_ARGS[0]}}"
+${CA_ROOT}/hack/e2e/run-e2e-tests.sh \
+  --report-prefix=standard_ \
+  "Standard Autoscaling${REMAINING_ARGS[0]:+.*${REMAINING_ARGS[0]}}"
 
 echo "### STEP 2: DRA Autoscaling tests ###"
 echo "Removing Cluster Autoscaler to reset its state..."
@@ -64,4 +67,6 @@ echo "Redeploying Cluster Autoscaler..."
 ${CA_ROOT}/hack/e2e/deploy-ca-on-gce-for-e2e.sh "${CA_IMAGE}"
 
 echo "Running DRA tests..."
-${CA_ROOT}/hack/e2e/run-e2e-tests.sh "DRA Autoscaling${REMAINING_ARGS[0]:+.*${REMAINING_ARGS[0]}}"
+${CA_ROOT}/hack/e2e/run-e2e-tests.sh \
+  --report-prefix=dra_ \
+  "DRA Autoscaling${REMAINING_ARGS[0]:+.*${REMAINING_ARGS[0]}}"

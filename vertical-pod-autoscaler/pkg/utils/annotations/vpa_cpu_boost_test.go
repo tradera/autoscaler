@@ -24,6 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 )
 
 func TestGetOriginalResourcesAnnotationValue(t *testing.T) {
@@ -103,10 +105,8 @@ func TestGetOriginalResourcesAnnotationValue(t *testing.T) {
 			var got OriginalResources
 			err = json.Unmarshal([]byte(val), &got)
 			assert.NoError(t, err)
-			assert.True(t, tc.expected.Requests.Cpu().Equal(*got.Requests.Cpu()), "CPU requests do not match")
-			assert.True(t, tc.expected.Requests.Memory().Equal(*got.Requests.Memory()), "Memory requests do not match")
-			assert.True(t, tc.expected.Limits.Cpu().Equal(*got.Limits.Cpu()), "CPU limits do not match")
-			assert.True(t, tc.expected.Limits.Memory().Equal(*got.Limits.Memory()), "Memory limits do not match")
+			test.AssertResourceListEqual(t, "requests", tc.expected.Requests, got.Requests)
+			test.AssertResourceListEqual(t, "limits", tc.expected.Limits, got.Limits)
 		})
 	}
 }
@@ -123,7 +123,7 @@ func TestGetOriginalResourcesFromAnnotation(t *testing.T) {
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						StartupCPUBoostAnnotation: `{"requests":{"cpu":"1","memory":"1Gi"},"limits":{"cpu":"2","memory":"2Gi"}}`,
+						GetStartupCPUBoostAnnotationKey("container1"): `{"requests":{"cpu":"1","memory":"1Gi"},"limits":{"cpu":"2","memory":"2Gi"}}`,
 					},
 				},
 			},
@@ -154,7 +154,7 @@ func TestGetOriginalResourcesFromAnnotation(t *testing.T) {
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						StartupCPUBoostAnnotation: "invalid-json",
+						GetStartupCPUBoostAnnotationKey("container1"): "invalid-json",
 					},
 				},
 			},
@@ -165,7 +165,7 @@ func TestGetOriginalResourcesFromAnnotation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := GetOriginalResourcesFromAnnotation(tc.pod)
+			got, err := GetOriginalResourcesFromAnnotation(tc.pod, "container1")
 			if tc.expectErr {
 				assert.Error(t, err)
 				return
@@ -175,10 +175,8 @@ func TestGetOriginalResourcesFromAnnotation(t *testing.T) {
 				assert.Nil(t, got)
 			} else {
 				assert.NotNil(t, got)
-				assert.True(t, tc.expected.Requests.Cpu().Equal(*got.Requests.Cpu()), "CPU requests do not match")
-				assert.True(t, tc.expected.Requests.Memory().Equal(*got.Requests.Memory()), "Memory requests do not match")
-				assert.True(t, tc.expected.Limits.Cpu().Equal(*got.Limits.Cpu()), "CPU limits do not match")
-				assert.True(t, tc.expected.Limits.Memory().Equal(*got.Limits.Memory()), "Memory limits do not match")
+				test.AssertResourceListEqual(t, "requests", tc.expected.Requests, got.Requests)
+				test.AssertResourceListEqual(t, "limits", tc.expected.Limits, got.Limits)
 			}
 		})
 	}

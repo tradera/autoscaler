@@ -20,12 +20,18 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"reflect"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/pflag"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	kube_client "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/leaderelection"
@@ -38,12 +44,14 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/patch"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/recommendation"
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	updater_config "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/config"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/inplace"
 	updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/logic"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/priority"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/client"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics"
 	metrics_updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/updater"
@@ -140,17 +148,31 @@ func defaultLeaderElectionConfiguration() componentbaseconfig.LeaderElectionConf
 }
 
 func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
 	kubeConfig := common.CreateKubeConfigOrDie(commonFlag.KubeConfig, float32(commonFlag.KubeApiQps), int(commonFlag.KubeApiBurst))
 	kubeClient := kube_client.NewForConfigOrDie(kubeConfig)
 	vpaClient := vpa_clientset.NewForConfigOrDie(kubeConfig)
-	kubeFactory := informers.NewSharedInformerFactoryWithOptions(kubeClient, defaultResyncPeriod, informers.WithNamespace(commonFlag.VpaObjectNamespace))
-	podLister := updater.NewPodLister(kubeClient, commonFlag.VpaObjectNamespace, stopCh)
+	kubeFactory := informers.NewSharedInformerFactoryWithOptions(kubeClient, defaultResyncPeriod,
+		informers.WithNamespace(commonFlag.VpaObjectNamespace),
+		informers.WithTransform(client.StripManagedFields),
+	)
+
+	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(kubeClient, defaultResyncPeriod,
+		informers.WithNamespace(commonFlag.VpaObjectNamespace),
+		informers.WithTransform(client.StripManagedFields),
+		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+			// Filter out unscheduled pods and pods in terminal phases (Succeeded/Failed)
+			opts.FieldSelector = "spec.nodeName!=" + "" + ",status.phase!=" +
+				string(corev1.PodSucceeded) + ",status.phase!=" + string(corev1.PodFailed)
+		}),
+	)
 	targetSelectorFetcher := target.NewVpaTargetSelectorFetcher(kubeConfig, kubeClient, kubeFactory, stopCh)
 	controllerFetcher := controllerfetcher.NewControllerFetcher(kubeConfig, kubeClient, kubeFactory, scaleCacheEntryFreshnessTime, scaleCacheEntryLifetime, scaleCacheEntryJitterFactor, stopCh)
-
 	var limitRangeCalculator limitrange.LimitRangeCalculator
 	limitRangeCalculator, err := limitrange.NewLimitsRangeCalculator(kubeFactory)
 	if err != nil {
@@ -161,6 +183,9 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 	admissionControllerStatusNamespace := status.AdmissionControllerStatusNamespace
 	if config.Namespace != "" {
 		admissionControllerStatusNamespace = config.Namespace
+	}
+	if config.AdmissionControllerStatusLeaseNamespace != "" {
+		admissionControllerStatusNamespace = config.AdmissionControllerStatusLeaseNamespace
 	}
 
 	ignoredNamespaces := strings.Split(commonFlag.IgnoredVpaObjectNamespaces, ",")
@@ -173,7 +198,7 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 		kubeClient,
 		vpaClient,
 		kubeFactory,
-		podLister,
+		podInformerFactory,
 		config.MinReplicas,
 		config.EvictionRateLimit,
 		config.EvictionRateBurst,
@@ -183,7 +208,9 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 		config.DefaultUpdateThreshold,
 		config.PodLifetimeUpdateThreshold,
 		config.EvictAfterOOMThreshold,
+		config.AdmissionControllerStatusLeaseName,
 		admissionControllerStatusNamespace,
+		config.AdmissionControllerStatusLeaseTimeout,
 		vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalculator),
 		priority.NewScalingDirectionPodEvictionAdmission(),
 		targetSelectorFetcher,
@@ -198,24 +225,51 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 		klog.FlushAndExit(klog.ExitFlushTimeout, 1)
 	}
 
-	// Start factories
 	kubeFactory.Start(stopCh)
-	informerMap := kubeFactory.WaitForCacheSync(stopCh)
-	for kind, synced := range informerMap {
-		if !synced {
-			klog.ErrorS(nil, fmt.Sprintf("Could not sync cache for the %s informer", kind.String()))
-			klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+	podInformerFactory.Start(stopCh)
+	for _, informerMap := range []map[reflect.Type]bool{
+		kubeFactory.WaitForCacheSync(stopCh),
+		podInformerFactory.WaitForCacheSync(stopCh),
+	} {
+		for kind, synced := range informerMap {
+			if !synced {
+				klog.ErrorS(nil, fmt.Sprintf("Could not sync cache for the %s informer", kind.String()))
+				klog.FlushAndExit(klog.ExitFlushTimeout, 1)
+			}
+		}
+	}
+
+	// Start boost worker only if CPUStartupBoost feature gate are enabled
+	if features.Enabled(features.CPUStartupBoost) {
+		var wg sync.WaitGroup
+		ctx, cancel := context.WithCancel(sigCtx)
+		defer func() {
+			cancel()
+			updater.ShutDown()
+			wg.Wait()
+		}()
+		for i := 0; i < config.ConcurrentCPUStartupBoostSyncs; i++ {
+			wg.Go(func() {
+				wait.UntilWithContext(ctx, updater.RunBoostWorker, time.Second)
+			})
 		}
 	}
 
 	// Start updating health check endpoint.
 	healthCheck.StartMonitoring()
 
-	ticker := time.Tick(config.UpdaterInterval)
-	for range ticker {
-		ctx, cancel := context.WithTimeout(context.Background(), config.UpdaterInterval)
-		updater.RunOnce(ctx)
-		healthCheck.UpdateLastActivity()
-		cancel()
+	ticker := time.NewTicker(config.UpdaterInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			loopCtx, loopCancel := context.WithTimeout(sigCtx, config.UpdaterInterval)
+			updater.RunOnce(loopCtx)
+			healthCheck.UpdateLastActivity()
+			loopCancel()
+		case <-sigCtx.Done():
+			klog.InfoS("Received shutdown signal, exiting")
+			return
+		}
 	}
 }

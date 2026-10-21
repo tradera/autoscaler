@@ -180,7 +180,7 @@ func mostRecentOOMKill(containerStatus corev1.ContainerStatus) *corev1.Container
 }
 
 // OnAdd is Noop
-func (o *observer) OnAdd(obj any, isInInitialList bool) {}
+func (*observer) OnAdd(obj any, isInInitialList bool) {}
 
 // OnUpdate inspects if the update contains oom information and
 // passess it to the ObservedOomsChannel

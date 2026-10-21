@@ -19,13 +19,13 @@ type: application
 # Chart version follows semver. The publish workflow overrides this at
 # package time when a `vpa-tradera-v*` tag is pushed; the value here is the
 # fallback used by `helm package` runs that don't go through CI.
-version: 0.9.0-tradera.0
+version: 0.14.0-tradera.0
 
 # Tracks the upstream VPA app version that this fork is based on plus a
 # Tradera suffix. The publish workflow overrides this at package time to
 # match the actual image tag, so `helm install` of a published chart pulls
 # the matching image without an explicit `image.tag` override.
-appVersion: "1.6.0-tradera.0"
+appVersion: "1.8.0-tradera.0"
 
 icon: https://github.com/kubernetes/kubernetes/raw/master/logo/logo.png
 

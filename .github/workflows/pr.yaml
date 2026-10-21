@@ -11,9 +11,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Not needed: this job only reads the repo and never pushes.
+          persist-credentials: false
       - id: filter
-        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             charts:
@@ -28,33 +31,38 @@ jobs:
     needs:
       - changes
     runs-on: ubuntu-latest
+    env:
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Not needed: this job only reads the repo and never pushes.
+          persist-credentials: false
       - name: Fetch history
         run: git fetch --prune --unshallow
       - name: Set up chart-testing
         uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
       - name: Run chart-testing for CA (lint)
-        run: ct lint --chart-dirs cluster-autoscaler/charts --target-branch ${{ github.event.pull_request.base.ref }}
+        run: ct lint --chart-dirs cluster-autoscaler/charts --target-branch "$BASE_REF"
       - name: Run chart-testing for VPA (lint)
-        run: ct lint --chart-dirs vertical-pod-autoscaler/charts --target-branch ${{ github.event.pull_request.base.ref }} --check-version-increment=false
+        run: ct lint --chart-dirs vertical-pod-autoscaler/charts --target-branch "$BASE_REF" --check-version-increment=false
       # Only build a kind cluster if there are chart changes to test.
       - name: Run chart-testing (list-changed)
         id: list-changed
         run: |
-          changed=$(ct list-changed --chart-dirs cluster-autoscaler/charts,vertical-pod-autoscaler/charts --target-branch ${{ github.event.pull_request.base.ref }})
+          changed=$(ct list-changed --chart-dirs cluster-autoscaler/charts,vertical-pod-autoscaler/charts --target-branch "$BASE_REF")
           if [[ -n "$changed" ]]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
       - if: steps.list-changed.outputs.changed == 'true'
         name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           config: .github/kind-config.yaml
       - if: steps.list-changed.outputs.changed == 'true'
         name: Run chart-testing (install)
-        run: ct install --chart-dirs cluster-autoscaler/charts,vertical-pod-autoscaler/charts --target-branch ${{ github.event.pull_request.base.ref }}
+        run: ct install --chart-dirs cluster-autoscaler/charts,vertical-pod-autoscaler/charts --target-branch "$BASE_REF"
   helm-docs-validate:
     if: ${{ needs.changes.outputs.charts == 'true' }}
     name: Helm Docs
@@ -63,9 +71,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Not needed: this job only reads the repo and never pushes.
+          persist-credentials: false
       - name: Run helm-docs
-        uses: losisin/helm-docs-github-action@3a4528e97c49a5e83de6b78c50c61c8ee5c9f944 # v2.0.0
+        uses: losisin/helm-docs-github-action@9e0787c426fdec38be6288bb5c0559dcb388412c # v2.0.1
         with:
           fail-on-diff: true
 

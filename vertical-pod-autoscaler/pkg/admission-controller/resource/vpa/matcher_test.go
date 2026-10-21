@@ -19,6 +19,7 @@ package vpa
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/mock/gomock"
@@ -27,11 +28,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/tools/cache"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	target_mock "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/mock"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
+	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
 func parseLabelSelector(selector string) labels.Selector {
@@ -65,6 +68,7 @@ func TestGetMatchingVpa(t *testing.T) {
 		AddContainer(test.Container().WithName("i-am-container").Get())
 	podBuilder := podBuilderWithoutCreator.WithCreator(&sts.ObjectMeta, &sts.TypeMeta)
 	vpaBuilder := test.VerticalPodAutoscaler().WithContainer("i-am-container")
+	factor := int32(1)
 
 	testCases := []struct {
 		name            string
@@ -123,8 +127,8 @@ func TestGetMatchingVpa(t *testing.T) {
 			name: "two vpas, one in off mode",
 			pod:  podBuilder.Get(),
 			vpas: []*vpa_types.VerticalPodAutoscaler{
-				vpaBuilder.WithUpdateMode(vpa_types.UpdateModeOff).WithName("off-vpa").WithTargetRef(targetRef).Get(),
-				vpaBuilder.WithUpdateMode(vpa_types.UpdateModeRecreate).WithName("recreate-vpa").WithTargetRef(targetRef).Get(),
+				vpaBuilder.WithUpdateMode(vpa_types.UpdateModeOff).WithName("off-vpa").WithCreationTimestamp(time.Now().Add(-time.Hour)).WithTargetRef(targetRef).Get(),
+				vpaBuilder.WithUpdateMode(vpa_types.UpdateModeRecreate).WithName("recreate-vpa").WithCreationTimestamp(time.Now()).WithTargetRef(targetRef).Get(),
 			},
 			labelSelector:   "app = test",
 			expectedFound:   true,
@@ -143,6 +147,35 @@ func TestGetMatchingVpa(t *testing.T) {
 			pod:           podBuilder.Get(),
 			vpas:          []*vpa_types.VerticalPodAutoscaler{},
 			expectedFound: false,
+		}, {
+			name: "vpa with update mode off but with startup boost is matched",
+			pod:  podBuilder.Get(),
+			vpas: []*vpa_types.VerticalPodAutoscaler{
+				vpaBuilder.WithName("off-with-boost-vpa").WithTargetRef(targetRef).WithUpdateMode(vpa_types.UpdateModeOff).WithCPUStartupBoost(vpa_types.FactorStartupBoostType, &factor, nil, 0).Get(),
+			},
+			labelSelector:   "app = test",
+			expectedFound:   true,
+			expectedVpaName: "off-with-boost-vpa",
+			// Tests that UpdateModeOff is bypassed if the VPA has a pod-level startup boost defined.
+		}, {
+			name: "vpa with update mode off but with container-level startup boost is matched",
+			pod:  podBuilder.Get(),
+			vpas: []*vpa_types.VerticalPodAutoscaler{
+				vpaBuilder.WithName("off-with-container-boost-vpa").WithTargetRef(targetRef).WithUpdateMode(vpa_types.UpdateModeOff).WithContainerCPUStartupBoost("i-am-container", vpa_types.FactorStartupBoostType, &factor, nil, 0).Get(),
+			},
+			labelSelector:   "app = test",
+			expectedFound:   true,
+			expectedVpaName: "off-with-container-boost-vpa",
+			// Tests that UpdateModeOff is bypassed if the VPA has only a container-level startup boost defined.
+		}, {
+			name: "vpa with default update mode and startup boost is matched",
+			pod:  podBuilder.Get(),
+			vpas: []*vpa_types.VerticalPodAutoscaler{
+				vpaBuilder.WithName("auto-with-boost-vpa").WithTargetRef(targetRef).WithCPUStartupBoost(vpa_types.FactorStartupBoostType, &factor, nil, 0).Get(),
+			},
+			labelSelector:   "app = test",
+			expectedFound:   true,
+			expectedVpaName: "auto-with-boost-vpa",
 		},
 	}
 
@@ -153,11 +186,10 @@ func TestGetMatchingVpa(t *testing.T) {
 
 			mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
 
-			vpaNamespaceLister := &test.VerticalPodAutoscalerListerMock{}
-			vpaNamespaceLister.On("List").Return(tc.vpas, nil)
-
-			vpaLister := &test.VerticalPodAutoscalerListerMock{}
-			vpaLister.On("VerticalPodAutoscalers", "default").Return(vpaNamespaceLister)
+			vpaIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, vpa_api_util.VPAIndexers())
+			for _, vpa := range tc.vpas {
+				assert.NoError(t, vpaIndexer.Add(vpa))
+			}
 
 			if tc.labelSelector != "" {
 				mockSelectorFetcher.EXPECT().Fetch(gomock.Any()).AnyTimes().Return(parseLabelSelector(tc.labelSelector), nil)
@@ -166,7 +198,7 @@ func TestGetMatchingVpa(t *testing.T) {
 			// In other words, it cannot go through the hierarchy of controllers like "ReplicaSet => Deployment"
 			// For this reason we are using "StatefulSet" as the ownerRef kind in the test, since it is a direct link.
 			// The hierarchy part is being test in the "TestControllerFetcher" test.
-			matcher := NewMatcher(vpaLister, mockSelectorFetcher, controllerfetcher.FakeControllerFetcher{})
+			matcher := NewMatcher(vpaIndexer, mockSelectorFetcher, controllerfetcher.FakeControllerFetcher{})
 
 			vpa := matcher.GetMatchingVPA(context.Background(), tc.pod)
 			if tc.expectedFound && assert.NotNil(t, vpa) {
