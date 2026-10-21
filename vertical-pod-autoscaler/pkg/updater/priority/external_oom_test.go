@@ -69,6 +69,37 @@ func TestExternalOOMBypassesGatesWithScopedAction(t *testing.T) {
 	pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1050Mi")
 	require.Empty(t, calculate(NewDefaultPodEvictionAdmission()))
 }
+func TestExternalOOMAdmissionTreatsOmittedCPUAsUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		resource  corev1.ResourceName
+		direction vpa_types.EvictionChangeRequirement
+		want      int
+	}{
+		{"CPU decrease required", corev1.ResourceCPU, vpa_types.TargetLowerThanRequests, 0},
+		{"CPU increase required", corev1.ResourceCPU, vpa_types.TargetHigherThanRequests, 0},
+		{"memory increase required", corev1.ResourceMemory, vpa_types.TargetHigherThanRequests, 1},
+		{"memory decrease required", corev1.ResourceMemory, vpa_types.TargetLowerThanRequests, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Second)
+			mode := vpa_types.UpdateModeInPlaceOrRecreate
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns", UID: "uid"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")}}}}}}
+			vpa := &vpa_types.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Annotations: map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}}, Spec: vpa_types.VerticalPodAutoscalerSpec{UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode, EvictionRequirements: []*vpa_types.EvictionRequirement{{Resources: []corev1.ResourceName{tc.resource}, ChangeRequirement: tc.direction}}}}, Status: vpa_types.VerticalPodAutoscalerStatus{Recommendation: &vpa_types.RecommendedPodResources{ContainerRecommendations: []vpa_types.RecommendedContainerResources{{ContainerName: "app", Target: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1200Mi")}}}}}}
+			setExternalOOMSignals(t, vpa, []annotations.ExternalOOMSignal{{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Second)), MemoryRequest: resource.MustParse("1Gi")}})
+			admission := NewScalingDirectionPodEvictionAdmission()
+			admission.LoopInit([]*corev1.Pod{pod}, map[*vpa_types.VerticalPodAutoscaler][]*corev1.Pod{vpa: {pod}})
+			calc := NewUpdatePriorityCalculator(vpa, UpdateConfig{}, vpa_api_util.NewCappingRecommendationProcessor(limitrange.NewNoopLimitsCalculator()), NewProcessor())
+			calc.AddPod(pod, now, nil)
+			updates := calc.GetSortedPodUpdates(admission)
+			require.Len(t, updates, tc.want)
+			if len(updates) > 0 {
+				require.NotContains(t, updates[0].VPA.Status.Recommendation.ContainerRecommendations[0].Target, corev1.ResourceCPU)
+			}
+		})
+	}
+}
+
 func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []annotations.ExternalOOMSignal) {
 	t.Helper()
 	value, err := annotations.EncodeExternalOOMSignals(signals, vpa.Annotations)

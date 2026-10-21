@@ -31,6 +31,7 @@ import (
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
+	resourcehelpers "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/resources"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
@@ -201,7 +202,22 @@ func (calc *UpdatePriorityCalculator) GetSortedPodUpdates(admission PodEvictionA
 
 	result := []PodUpdate{}
 	for _, podPrio := range calc.pods {
-		if admission.Admit(podPrio.pod, podPrio.recommendation) {
+		admissionRecommendation := podPrio.recommendation
+		if podPrio.externalOOM {
+			// Admission compares complete resulting requests. An omitted CPU
+			// target means unchanged, not zero; keep the resize snapshot sparse.
+			admissionRecommendation = podPrio.recommendation.DeepCopy()
+			for i := range admissionRecommendation.ContainerRecommendations {
+				rec := &admissionRecommendation.ContainerRecommendations[i]
+				requests, _ := resourcehelpers.ContainerRequestsAndLimits(rec.ContainerName, podPrio.pod)
+				for resourceName, request := range requests {
+					if _, changed := rec.Target[resourceName]; !changed {
+						rec.Target[resourceName] = request.DeepCopy()
+					}
+				}
+			}
+		}
+		if admission.Admit(podPrio.pod, admissionRecommendation) {
 			result = append(result, PodUpdate{Pod: podPrio.pod, VPA: podPrio.vpa, ExternalOOM: podPrio.externalOOM})
 		} else {
 			klog.V(2).InfoS("Pod removed from update queue by PodEvictionAdmission", "pod", klog.KObj(podPrio.pod))
