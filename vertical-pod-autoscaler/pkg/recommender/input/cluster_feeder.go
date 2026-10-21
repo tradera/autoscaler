@@ -735,7 +735,7 @@ Loop:
 		select {
 		case oomInfo := <-feeder.oomChan:
 			klog.V(3).InfoS("OOM detected", "oomInfo", oomInfo)
-			if err = feeder.clusterState.RecordOOM(oomInfo.ContainerID, oomInfo.Timestamp, oomInfo.Memory); err != nil {
+			if err = feeder.recordOOM(oomInfo); err != nil {
 				klog.V(0).InfoS("Failed to record OOM", "oomInfo", oomInfo, "error", err)
 			}
 		default:

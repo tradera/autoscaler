@@ -385,6 +385,7 @@ func (cluster *clusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	vpa.SetResourcePolicy(apiObject.Spec.ResourcePolicy)
 	vpa.SetAPIVersion(apiObject.GetObjectKind().GroupVersionKind().Version)
 	vpa.Generation = apiObject.Generation
+	vpa.MergeExternalOOMSignals(apiObject.Status.ExternalOOMSignals, time.Now())
 	return nil
 }
 

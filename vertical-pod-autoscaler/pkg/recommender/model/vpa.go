@@ -174,7 +174,8 @@ func (vpa *Vpa) updateRecommendationLocked(recommendation *vpa_types.Recommended
 // Vpa (Vertical Pod Autoscaler) object is responsible for vertical scaling of
 // Pods matching a given label selector.
 type Vpa struct {
-	ID VpaID
+	externalOOMSignals []vpa_types.ExternalOOMSignal
+	ID                 VpaID
 	// Labels selector that determines which Pods are controlled by this VPA
 	// object. Can be nil, in which case no Pod is matched.
 	PodSelector labels.Selector
@@ -378,7 +379,8 @@ func (vpa *Vpa) AsStatus() *vpa_types.VerticalPodAutoscalerStatus {
 	vpa.mutex.RLock()
 	defer vpa.mutex.RUnlock()
 	status := &vpa_types.VerticalPodAutoscalerStatus{
-		Conditions: vpa.conditions.AsList(),
+		Conditions:         vpa.conditions.AsList(),
+		ExternalOOMSignals: vpa.externalOOMSignalsLocked(time.Now()),
 	}
 	if vpa.recommendation != nil {
 		status.Recommendation = vpa.recommendation

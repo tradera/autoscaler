@@ -267,6 +267,7 @@ func testRunOnceBase(
 	expectedInPlacedCount int,
 	canInPlaceUpdate utils.InPlaceDecision,
 	isCPUBoostTest bool,
+	externalOOM ...bool,
 ) {
 	featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.CPUStartupBoost, true)
 	ctrl := gomock.NewController(t)
@@ -292,7 +293,7 @@ func testRunOnceBase(
 	}
 	pods := make([]*corev1.Pod, livePods)
 	eviction := &test.PodsEvictionRestrictionMock{}
-	inplace := &test.PodsInPlaceRestrictionMock{}
+	inplace := &checkingExternalOOMRestriction{}
 
 	vpaObj := test.VerticalPodAutoscaler().
 		WithContainer(containerName).
@@ -350,6 +351,18 @@ func testRunOnceBase(
 	podLister.On("List").Return(pods, nil)
 
 	vpaObj.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{UpdateMode: &updateMode}
+	if len(externalOOM) > 0 && externalOOM[0] {
+		vpaObj.Namespace = "default"
+		vpaObj.Annotations = map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}
+		for _, pod := range pods {
+			pod.UID = types.UID(pod.Name)
+			vpaObj.Status.ExternalOOMSignals = append(vpaObj.Status.ExternalOOMSignals, vpa_types.ExternalOOMSignal{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: containerName, ObservedAt: metav1.NewTime(time.Now().Add(-time.Second)), MemoryRequest: resource.MustParse("100M")})
+		}
+		inplace.check = func(action *vpa_types.VerticalPodAutoscaler) {
+			require.Len(t, action.Status.Recommendation.ContainerRecommendations, 1)
+			require.NotContains(t, action.Status.Recommendation.ContainerRecommendations[0].Target, corev1.ResourceCPU)
+		}
+	}
 	if isCPUBoostTest {
 		durationSeconds := int32(60)
 		cpuStartupBoost := &vpa_types.GenericStartupBoost{

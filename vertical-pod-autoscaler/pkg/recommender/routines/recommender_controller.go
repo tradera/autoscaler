@@ -28,11 +28,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	kube_client "k8s.io/client-go/kubernetes"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	resourceclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
+	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/checkpoint"
 	recommender_config "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/config"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input"
@@ -81,6 +83,7 @@ func NewRecommenderController(
 	clusterState := model.NewClusterState(aggregateContainerStateGCInterval)
 	controllerFetcher := controllerfetcher.NewControllerFetcher(kubeConfig, kubeClient, factory, scaleCacheEntryFreshnessTime, scaleCacheEntryLifetime, scaleCacheEntryJitterFactor, stopCh)
 	podLister, oomObserver := input.NewPodListerAndOOMObserver(ctx, kubeClient, commonFlags.VpaObjectNamespace, stopCh)
+	vpaLister := vpa_api_util.NewVpasLister(vpaClient, stopCh, commonFlags.VpaObjectNamespace)
 
 	// One Prometheus client serves both the per-VPA OOM observer and the
 	// per-VPA history backfiller. Both features are opt-in via VPA
@@ -98,7 +101,7 @@ func NewRecommenderController(
 		}
 	}
 
-	if err := startPrometheusOOMObserver(ctx, config, clusterState, oomObserver.GetObservedOomsChannel(), promAPI); err != nil {
+	if err := startPrometheusOOMObserver(ctx, config, oomObserver.GetObservedOomsChannel(), promAPI, podLister, vpaLister); err != nil {
 		return nil, err
 	}
 
@@ -181,7 +184,7 @@ func NewRecommenderController(
 		OOMObserver:         oomObserver,
 		MetricsClient:       input_metrics.NewMetricsClient(source, commonFlags.VpaObjectNamespace, "default-metrics-client"),
 		VpaCheckpointClient: vpaClient.AutoscalingV1(),
-		VpaLister:           vpa_api_util.NewVpasLister(vpaClient, stopCh, commonFlags.VpaObjectNamespace),
+		VpaLister:           vpaLister,
 		VpaCheckpointLister: vpa_api_util.NewVpaCheckpointLister(vpaClient, stopCh, commonFlags.VpaObjectNamespace),
 		ClusterState:        clusterState,
 		SelectorFetcher:     target.NewVpaTargetSelectorFetcher(kubeConfig, kubeClient, factory, stopCh),
@@ -265,7 +268,7 @@ func (c *RecommenderController) Run(ctx context.Context) error {
 //
 // promAPI is supplied by the caller (nil = disabled). Without any annotated
 // VPAs the observer issues no queries — the cost is an idle ticker.
-func startPrometheusOOMObserver(ctx context.Context, config *recommender_config.RecommenderConfig, clusterState model.ClusterState, oomChan chan<- oom.OomInfo, promAPI prometheusv1.API) error {
+func startPrometheusOOMObserver(ctx context.Context, config *recommender_config.RecommenderConfig, oomChan chan<- oom.OomInfo, promAPI prometheusv1.API, podLister listersv1.PodLister, vpaLister vpa_lister.VerticalPodAutoscalerLister) error {
 	if promAPI == nil {
 		return nil
 	}
@@ -274,13 +277,16 @@ func startPrometheusOOMObserver(ctx context.Context, config *recommender_config.
 		return fmt.Errorf("parse query-timeout for OOM observer: %w", err)
 	}
 	observer := oom.NewPrometheusObserver(oom.PrometheusObserverConfig{
-		API:            promAPI,
-		ClusterState:   clusterState,
-		OomChan:        oomChan,
-		PollInterval:   config.PrometheusOOMObserverInterval,
-		QueryTimeout:   queryTimeout,
-		PodLabel:       config.CtrPodNameLabel,
-		ContainerLabel: config.CtrNameLabel,
+		API:               promAPI,
+		PodLister:         podLister,
+		VPALister:         vpaLister,
+		RecommenderName:   config.RecommenderName,
+		IgnoredNamespaces: strings.Split(config.CommonFlags.IgnoredVpaObjectNamespaces, ","),
+		OomChan:           oomChan,
+		PollInterval:      config.PrometheusOOMObserverInterval,
+		QueryTimeout:      queryTimeout,
+		PodLabel:          config.CtrPodNameLabel,
+		ContainerLabel:    config.CtrNameLabel,
 	})
 	go observer.Run(ctx)
 	klog.V(1).InfoS("Started Prometheus OOM observer", "interval", config.PrometheusOOMObserverInterval, "address", config.PrometheusAddress)
