@@ -62,9 +62,16 @@ func PrepareExternalOOMUpdate(vpa *vpa_types.VerticalPodAutoscaler, pod *corev1.
 		if signal.Metric != annotations.OOMCounterMetric(vpa.Annotations) || !ValidExternalOOMSignal(signal, vpa.Generation, now) || signal.PodUID != pod.UID || signal.PodName != pod.Name {
 			continue
 		}
+		container := getContainer(signal.ContainerName, pod)
+		if container == nil {
+			continue
+		}
 		requests, _ := resourcehelpers.ContainerRequestsAndLimits(signal.ContainerName, pod)
 		current := requests[corev1.ResourceMemory]
-		if current.Sign() > 0 && current.Cmp(signal.MemoryRequest) <= 0 {
+		desired := container.Resources.Requests[corev1.ResourceMemory]
+		// A submitted increase consumes the signal before kubelet status catches
+		// up. Checking only applied resources could expedite another increase.
+		if current.Sign() > 0 && current.Cmp(signal.MemoryRequest) <= 0 && desired.Cmp(signal.MemoryRequest) <= 0 {
 			signaled[signal.ContainerName] = true
 		}
 	}

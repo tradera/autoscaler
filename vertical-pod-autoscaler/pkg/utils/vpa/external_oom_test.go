@@ -82,6 +82,10 @@ func TestPrepareExternalOOMUpdate(t *testing.T) {
 		{"request already increased", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
 			p.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1100Mi")
 		}},
+		{"desired request increased before status catches up", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "app", Resources: &corev1.ResourceRequirements{Requests: p.Spec.Containers[0].Resources.Requests.DeepCopy()}}}
+			p.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1100Mi")
+		}},
 		{"no increase", func(_ *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, r *vpa_types.RecommendedPodResources) {
 			r.ContainerRecommendations[0].Target[corev1.ResourceMemory] = resource.MustParse("1Gi")
 		}},
