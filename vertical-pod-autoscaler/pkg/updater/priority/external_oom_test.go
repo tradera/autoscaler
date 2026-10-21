@@ -53,7 +53,7 @@ func TestExternalOOMBypassesGatesWithScopedAction(t *testing.T) {
 		return calc.GetSortedPodUpdates(admission)
 	}
 	require.Empty(t, calculate(NewDefaultPodEvictionAdmission()), "young pod inside bounds uses ordinary waiting rules")
-	vpa.Status.ExternalOOMSignals = []vpa_types.ExternalOOMSignal{{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Second)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 1}}
+	setExternalOOMSignals(t, vpa, []annotations.ExternalOOMSignal{{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Second)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 1}})
 	updates := calculate(NewDefaultPodEvictionAdmission())
 	require.Len(t, updates, 1)
 	require.True(t, updates[0].ExternalOOM)
@@ -68,4 +68,10 @@ func TestExternalOOMBypassesGatesWithScopedAction(t *testing.T) {
 	// The same signal must not expedite another step after an in-place increase.
 	pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1050Mi")
 	require.Empty(t, calculate(NewDefaultPodEvictionAdmission()))
+}
+func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []annotations.ExternalOOMSignal) {
+	t.Helper()
+	value, err := annotations.EncodeExternalOOMSignals(signals, vpa.Annotations)
+	require.NoError(t, err)
+	vpa.Annotations[annotations.ExternalOOMSignalsAnnotation] = value
 }

@@ -25,7 +25,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
-	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/oom"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
@@ -46,7 +45,7 @@ func (feeder *clusterStateFeeder) recordOOM(info oom.OomInfo) error {
 	if pod.UID != info.PodUID || pod.Namespace != vpa.ID.Namespace || !vpa.PodSelector.Matches(labels.Set(pod.Labels)) {
 		return errors.New("external OOM pod identity or ownership changed")
 	}
-	signal := vpa_types.ExternalOOMSignal{
+	signal := annotations.ExternalOOMSignal{
 		Metric:  info.Metric,
 		PodName: pod.Name, PodUID: pod.UID, ContainerName: info.ContainerID.ContainerName,
 		ObservedAt: metav1.NewTime(info.Timestamp), MemoryRequest: *resource.NewQuantity(int64(info.Memory), resource.BinarySI),
@@ -64,7 +63,7 @@ func (feeder *clusterStateFeeder) recordOOM(info oom.OomInfo) error {
 	if !vpa_api_util.ValidExternalOOMSignal(signal, vpa.Generation, now) {
 		return nil
 	}
-	vpa.MergeExternalOOMSignals([]vpa_types.ExternalOOMSignal{signal}, now)
+	vpa.MergeExternalOOMSignals([]annotations.ExternalOOMSignal{signal}, now)
 	klog.V(2).InfoS("Accepted external OOM observation", "pod", klog.KObj(pod), "container", info.ContainerID.ContainerName, "vpa", vpa.ID.VpaName)
 	return nil
 }

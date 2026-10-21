@@ -356,7 +356,7 @@ func testRunOnceBase(
 		vpaObj.Annotations = map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}
 		for _, pod := range pods {
 			pod.UID = types.UID(pod.Name)
-			vpaObj.Status.ExternalOOMSignals = append(vpaObj.Status.ExternalOOMSignals, vpa_types.ExternalOOMSignal{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: containerName, ObservedAt: metav1.NewTime(time.Now().Add(-time.Second)), MemoryRequest: resource.MustParse("100M")})
+			setExternalOOMSignals(t, vpaObj, append(annotations.ParseExternalOOMSignals(vpaObj.Annotations), annotations.ExternalOOMSignal{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: containerName, ObservedAt: metav1.NewTime(time.Now().Add(-time.Second)), MemoryRequest: resource.MustParse("100M")}))
 		}
 		inplace.check = func(action *vpa_types.VerticalPodAutoscaler) {
 			require.Len(t, action.Status.Recommendation.ContainerRecommendations, 1)
@@ -1199,4 +1199,11 @@ func TestProcessNextBoostItem_RetryExhaustion_ThenResync(t *testing.T) {
 	assert.True(t, u.processNextBoostItem(ctx))
 	inplace.AssertNumberOfCalls(t, "InPlaceUpdate", 1)
 	assert.Equal(t, 0, queue.Len(), "queue should be empty after successful unboost")
+}
+
+func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []annotations.ExternalOOMSignal) {
+	t.Helper()
+	value, err := annotations.EncodeExternalOOMSignals(signals, vpa.Annotations)
+	require.NoError(t, err)
+	vpa.Annotations[annotations.ExternalOOMSignalsAnnotation] = value
 }

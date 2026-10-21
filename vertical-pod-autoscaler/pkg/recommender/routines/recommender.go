@@ -103,6 +103,10 @@ func processVPAUpdate(r *recommender, vpa *model.Vpa, observedVpa *vpaautoscalin
 		}
 	}
 
+	// Metadata transport is optional and must not block ordinary recommendations.
+	if _, err := vpa_utils.UpdateExternalOOMSignalsIfNeeded(r.vpaClient.VerticalPodAutoscalers(vpa.ID.Namespace), observedVpa, vpa.ExternalOOMSignals()); err != nil {
+		klog.ErrorS(err, "Cannot publish external OOM annotation", "vpa", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName))
+	}
 	_, err := vpa_utils.UpdateVpaStatusIfNeeded(
 		r.vpaClient.VerticalPodAutoscalers(vpa.ID.Namespace), vpa.ID.VpaName, vpa.AsStatus(), &observedVpa.Status)
 	if err != nil {

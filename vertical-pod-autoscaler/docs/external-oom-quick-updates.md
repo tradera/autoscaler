@@ -6,22 +6,53 @@ The fork can use an application OOM counter to accelerate an in-place memory inc
 
 <!-- toc -->
 - [Requirements](#requirements)
+  - [Signal publication permission](#signal-publication-permission)
 - [Behavior](#behavior)
 - [Observability and rollout](#observability-and-rollout)
 <!-- /toc -->
 
 ## Requirements
 
-- Install the updated VPA CRDs, recommender and updater from the same fork revision. Older CRDs prune the optional signal field; older updaters ignore it.
+- Keep the installed upstream VPA CRDs unchanged. Run the fork's recommender and updater with annotation-based signal support; older components ignore the signal annotation.
 - Use `InPlace` or `InPlaceOrRecreate` with the corresponding Kubernetes support and VPA feature gates enabled.
 - Configure the existing `external.vpa.k8s.io/oom-counter-metric` VPA annotation with a Prometheus counter selector. Its pod/container labels must match the observer configuration, and its series must be scoped to the VPA's target pods.
 - Allow the observer to establish a baseline. Its first observation does not synthesize historical OOM events.
 
-No additional Kubernetes write permission is needed: the recommender uses its existing VPA status writer.
+### Signal publication permission
+
+The shortcut needs `patch` permission on VPA metadata, separate from ordinary `verticalpodautoscalers/status` writes. Grant it to the recommender independently of the chart. For example, this namespaced binding permits publication only for VPAs in `workloads`; adjust the VPA namespace and existing recommender ServiceAccount name/namespace:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vpa-external-oom-annotation-writer
+  namespace: workloads
+rules:
+  - apiGroups: ["autoscaling.k8s.io"]
+    resources: ["verticalpodautoscalers"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vpa-external-oom-annotation-writer
+  namespace: workloads
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vpa-external-oom-annotation-writer
+subjects:
+  - kind: ServiceAccount
+    name: vpa-recommender
+    namespace: kube-system
+```
+
+Without this permission, ordinary OOM sizing and recommendation status updates continue. The recommender logs `Cannot publish external OOM annotation`; the updater cannot expedite an unpublished observation.
 
 ## Behavior
 
-An accepted counter increase follows the existing OOM histogram path. After successful ingestion, the recommender also publishes an `externalOOMSignals` status entry containing the pod name and UID, container name, counter selector, VPA generation, observation time and memory request at observation. Signals are restored from status after recommender restarts, expire after ten minutes, and are limited to the 128 newest pod/container entries per VPA. Counter selectors longer than 1024 bytes are not eligible for this signal path.
+An accepted counter increase follows the existing OOM histogram path. After successful ingestion, the recommender also publishes a versioned `external.vpa.k8s.io/oom-signals` annotation containing the pod name and UID, container name, counter selector, VPA generation, observation time and memory request at observation. Signals are restored from that annotation after recommender restarts and expire after ten minutes. Retention is limited to 128 pod/container entries; the annotation carries the newest entries that fit within 32 KiB and the remaining Kubernetes annotation budget. Metadata writes protect the VPA UID and resource version and leave other annotations unchanged. Malformed, oversized or unknown-version payloads are ignored. Counter selectors longer than 1024 bytes are not eligible for this signal path.
 
 The updater can bypass the normal pod-lifetime and minimum-change gates when the exact pod/container has a fresh signal and the policy-capped memory recommendation exceeds its current request. It retains the normal admission, disruption-budget, rate-limit, resource-policy and infeasible-update safeguards.
 
@@ -33,6 +64,6 @@ This is **not a forced recommendation increase or memory floor**. The histogram 
 
 ## Observability and rollout
 
-The recommender logs `Accepted external OOM observation` after successful ingestion. Inspect `status.externalOOMSignals` alongside `status.recommendation` to distinguish an accepted signal from a recommendation that remains unchanged or capped.
+The recommender logs `Accepted external OOM observation` after successful ingestion. Inspect `metadata.annotations["external.vpa.k8s.io/oom-signals"]` alongside `status.recommendation` to distinguish an accepted signal from a recommendation that remains unchanged or capped.
 
-Upgrade the CRDs before relying on signal propagation, then upgrade both components. Removing the OOM-counter annotation disables this shortcut and prunes retained signals on the next recommender refresh. Rolling either component back leaves the ordinary recommendation and update paths available; the optional status field is not required for sizing.
+Keep the existing CRDs and chart unchanged. Grant the metadata-write permission separately, then upgrade the recommender and updater. Removing the OOM-counter annotation disables this shortcut and prunes retained signals on the next recommender refresh. Rolling either component back leaves the ordinary recommendation and update paths available; the optional annotation is not required for sizing. Removing the counter configuration disables expedited use immediately, even if metadata cleanup is denied.

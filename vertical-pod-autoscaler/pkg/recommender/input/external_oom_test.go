@@ -53,7 +53,7 @@ func externalOOMFixture(t *testing.T) (*clusterStateFeeder, *vpa_types.VerticalP
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Second)
 	mode := vpa_types.UpdateModeInPlaceOrRecreate
-	source := &vpa_types.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "vpa", Generation: 1, Annotations: map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}}, Spec: vpa_types.VerticalPodAutoscalerSpec{UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode}}}
+	source := &vpa_types.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "vpa", UID: "vpa-uid", Generation: 1, Annotations: map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}}, Spec: vpa_types.VerticalPodAutoscalerSpec{UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode}}}
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns", UID: "uid-1", CreationTimestamp: metav1.NewTime(now.Add(-time.Hour))}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")}}}}}, Status: corev1.PodStatus{StartTime: &metav1.Time{Time: now.Add(-time.Minute)}}}
 	pod.Spec.Containers[0].Resources.Limits = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("2Gi")}
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: "sidecar", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10m"), corev1.ResourceMemory: resource.MustParse("32Mi")}}})
@@ -99,17 +99,17 @@ func TestExternalOOMCounterToStatusAndQuickUpdate(t *testing.T) {
 	// Production polling must use informer snapshots, not race the main
 	// loop while it records the signal and updates mutable model metadata.
 	feeder.LoadRealTimeMetrics(t.Context())
-	status := feeder.clusterState.VPAs()[info.VpaID].AsStatus()
-	require.Len(t, status.ExternalOOMSignals, 1)
-	require.Equal(t, pod.UID, status.ExternalOOMSignals[0].PodUID)
+	signals := feeder.clusterState.VPAs()[info.VpaID].ExternalOOMSignals()
+	require.Len(t, signals, 1)
+	require.Equal(t, pod.UID, signals[0].PodUID)
 	require.NotZero(t, feeder.clusterState.GetContainer(info.ContainerID).GetMaxMemoryPeak())
-	// Persist and read through the same status patch API as the recommender.
+	// Persist and read through the same metadata patch API as the recommender.
 	apiClient := vpa_fake.NewSimpleClientset(source) //nolint:staticcheck // Generated client has no replacement constructor.
-	_, err = vpa_api_util.UpdateVpaStatusIfNeeded(apiClient.AutoscalingV1().VerticalPodAutoscalers("ns"), "vpa", status, &source.Status)
+	_, err = vpa_api_util.UpdateExternalOOMSignalsIfNeeded(apiClient.AutoscalingV1().VerticalPodAutoscalers("ns"), source, signals)
 	require.NoError(t, err)
 	published, err := apiClient.AutoscalingV1().VerticalPodAutoscalers("ns").Get(t.Context(), "vpa", metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Len(t, published.Status.ExternalOOMSignals, 1)
+	require.Len(t, annotations.ParseExternalOOMSignals(published.Annotations), 1)
 	// No artificial pod OOMKilled status is needed. A current recommendation
 	// inside its bounds can now update this young pod without CPU downsizing.
 	published.Status.Recommendation = &vpa_types.RecommendedPodResources{ContainerRecommendations: []vpa_types.RecommendedContainerResources{{ContainerName: "app", Target: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1200Mi")}}}}
@@ -143,7 +143,7 @@ func TestExternalOOMRejectedObservationsDoNotPublish(t *testing.T) {
 			f, _, _, i := externalOOMFixture(t)
 			tc.change(&i)
 			require.Error(t, f.recordOOM(i))
-			require.Empty(t, f.clusterState.VPAs()[i.VpaID].AsStatus().ExternalOOMSignals)
+			require.Empty(t, f.clusterState.VPAs()[i.VpaID].ExternalOOMSignals())
 		})
 	}
 	t.Run("expired signal still contributes to histogram", func(t *testing.T) {
@@ -151,13 +151,13 @@ func TestExternalOOMRejectedObservationsDoNotPublish(t *testing.T) {
 		i.Timestamp = time.Now().Add(-11 * time.Minute)
 		require.NoError(t, f.recordOOM(i))
 		require.NotZero(t, f.clusterState.GetContainer(i.ContainerID).GetMaxMemoryPeak())
-		require.Empty(t, f.clusterState.VPAs()[i.VpaID].AsStatus().ExternalOOMSignals)
+		require.Empty(t, f.clusterState.VPAs()[i.VpaID].ExternalOOMSignals())
 	})
 	t.Run("histogram rejects old observation", func(t *testing.T) {
 		f, _, _, i := externalOOMFixture(t)
 		// Place the model more than an aggregation interval ahead of the event.
 		require.NoError(t, f.clusterState.AddSample(&model.ContainerUsageSampleWithKey{Container: i.ContainerID, ContainerUsageSample: model.ContainerUsageSample{MeasureStart: time.Now().Add(48 * time.Hour), Resource: model.ResourceMemory, Usage: 1}}))
 		require.Error(t, f.recordOOM(i))
-		require.Empty(t, f.clusterState.VPAs()[i.VpaID].AsStatus().ExternalOOMSignals)
+		require.Empty(t, f.clusterState.VPAs()[i.VpaID].ExternalOOMSignals())
 	})
 }

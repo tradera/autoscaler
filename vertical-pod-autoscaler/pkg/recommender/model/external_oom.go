@@ -21,14 +21,13 @@ import (
 	"slices"
 	"time"
 
-	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
-// MergeExternalOOMSignals retains accepted observations across status writes and
+// MergeExternalOOMSignals retains accepted observations across annotation writes and
 // recommender restarts. Identical observations never refresh their timestamp.
-func (vpa *Vpa) MergeExternalOOMSignals(signals []vpa_types.ExternalOOMSignal, now time.Time) {
+func (vpa *Vpa) MergeExternalOOMSignals(signals []annotations.ExternalOOMSignal, now time.Time) {
 	vpa.mutex.Lock()
 	defer vpa.mutex.Unlock()
 	if annotations.OOMCounterMetric(vpa.Annotations) == "" {
@@ -36,8 +35,8 @@ func (vpa *Vpa) MergeExternalOOMSignals(signals []vpa_types.ExternalOOMSignal, n
 		return
 	}
 	type key struct{ uid, container string }
-	latest := make(map[key]vpa_types.ExternalOOMSignal)
-	add := func(signal vpa_types.ExternalOOMSignal) {
+	latest := make(map[key]annotations.ExternalOOMSignal)
+	add := func(signal annotations.ExternalOOMSignal) {
 		if signal.Metric != annotations.OOMCounterMetric(vpa.Annotations) || !vpa_api_util.ValidExternalOOMSignal(signal, vpa.Generation, now) {
 			return
 		}
@@ -58,7 +57,7 @@ func (vpa *Vpa) MergeExternalOOMSignals(signals []vpa_types.ExternalOOMSignal, n
 		vpa.externalOOMSignals = append(vpa.externalOOMSignals, signal)
 	}
 	// Cap by recency before sorting for deterministic status serialization.
-	slices.SortFunc(vpa.externalOOMSignals, func(a, b vpa_types.ExternalOOMSignal) int {
+	slices.SortFunc(vpa.externalOOMSignals, func(a, b annotations.ExternalOOMSignal) int {
 		if c := b.ObservedAt.Compare(a.ObservedAt.Time); c != 0 {
 			return c
 		}
@@ -70,7 +69,7 @@ func (vpa *Vpa) MergeExternalOOMSignals(signals []vpa_types.ExternalOOMSignal, n
 	if len(vpa.externalOOMSignals) > vpa_api_util.MaxExternalOOMSignals {
 		vpa.externalOOMSignals = vpa.externalOOMSignals[:vpa_api_util.MaxExternalOOMSignals]
 	}
-	slices.SortFunc(vpa.externalOOMSignals, func(a, b vpa_types.ExternalOOMSignal) int {
+	slices.SortFunc(vpa.externalOOMSignals, func(a, b annotations.ExternalOOMSignal) int {
 		if c := cmp.Compare(a.PodUID, b.PodUID); c != 0 {
 			return c
 		}
@@ -78,8 +77,14 @@ func (vpa *Vpa) MergeExternalOOMSignals(signals []vpa_types.ExternalOOMSignal, n
 	})
 }
 
-func (vpa *Vpa) externalOOMSignalsLocked(now time.Time) []vpa_types.ExternalOOMSignal {
-	var result []vpa_types.ExternalOOMSignal
+// ExternalOOMSignals returns independent annotation evidence, never VPA status.
+func (vpa *Vpa) ExternalOOMSignals() []annotations.ExternalOOMSignal {
+	vpa.mutex.RLock()
+	defer vpa.mutex.RUnlock()
+	return vpa.externalOOMSignalsLocked(time.Now())
+}
+func (vpa *Vpa) externalOOMSignalsLocked(now time.Time) []annotations.ExternalOOMSignal {
+	var result []annotations.ExternalOOMSignal
 	for _, signal := range vpa.externalOOMSignals {
 		if signal.Metric == annotations.OOMCounterMetric(vpa.Annotations) && vpa_api_util.ValidExternalOOMSignal(signal, vpa.Generation, now) {
 			result = append(result, *signal.DeepCopy())

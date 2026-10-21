@@ -110,29 +110,6 @@ _Appears in:_
 | `changeRequirement` _[EvictionChangeRequirement](#evictionchangerequirement)_ |  |  | Enum: [TargetHigherThanRequests TargetLowerThanRequests] <br /> |
 
 
-#### ExternalOOMSignal
-
-
-
-ExternalOOMSignal identifies an accepted application OOM observation. It is
-advisory evidence for expedited in-place memory updates, not a recommendation.
-
-
-
-_Appears in:_
-- [VerticalPodAutoscalerStatus](#verticalpodautoscalerstatus)
-
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
-| `metric` _string_ | Metric binds the observation to the configured counter selector. |  | MaxLength: 1024 <br /> |
-| `podName` _string_ |  |  |  |
-| `podUID` _[UID](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#uid-types-pkg)_ |  |  |  |
-| `containerName` _string_ |  |  |  |
-| `observedAt` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#time-v1-meta)_ |  |  |  |
-| `memoryRequest` _[Quantity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#quantity-resource-api)_ | MemoryRequest is the request before the OOM. A subsequent increase consumes<br />the signal, even if the recommendation continues rising. |  |  |
-| `observedGeneration` _integer_ | ObservedGeneration binds the signal to the VPA policy that accepted it. |  |  |
-
-
 
 
 #### HistogramCheckpoint
@@ -462,7 +439,6 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `recommendation` _[RecommendedPodResources](#recommendedpodresources)_ | The most recently computed amount of resources recommended by the<br />autoscaler for the controlled pods. |  | Optional: \{\} <br /> |
-| `externalOOMSignals` _[ExternalOOMSignal](#externaloomsignal) array_ | ExternalOOMSignals are recent accepted application OOM observations.<br />Signals expire after ten minutes and apply only to the exact pod UID and<br />container. Older components may ignore this optional field. |  | MaxItems: 128 <br />Optional: \{\} <br /> |
 | `conditions` _[VerticalPodAutoscalerCondition](#verticalpodautoscalercondition) array_ | Conditions is the set of conditions required for this autoscaler to scale its target,<br />and indicates whether or not those conditions are met. |  | Optional: \{\} <br /> |
 | `observedGeneration` _integer_ | observedGeneration is the most recent generation observed by this autoscaler. |  | Minimum: 0 <br />Optional: \{\} <br /> |
 

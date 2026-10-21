@@ -48,7 +48,7 @@ Read more about them on the [components](./docs/components.md) page.
 
 You can also read about the [features](./docs/features.md) and [known limitations](./docs/known-limitations.md) of the VPA.
 
-This fork also supports [expedited in-place memory updates from application OOM counters](./docs/external-oom-quick-updates.md).
+This fork also supports [expedited in-place memory updates from application OOM counters](./docs/external-oom-quick-updates.md) through opt-in annotations, without CRD changes.
 
 > [!IMPORTANT]
 > At the moment, VPA is not compatible with workloads that define pod-level `resources` stanzas. Work has started to add pod-level resources support for VPA, for more details see [AEP-7571](https://github.com/kubernetes/autoscaler/pull/8586). Users of VPA may encounter the following issues if they enable VPA for a workload with a pod-level resources stanza defined:

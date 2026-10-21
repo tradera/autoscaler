@@ -34,7 +34,7 @@ func TestPrepareExternalOOMUpdate(t *testing.T) {
 	fixture := func() (*vpa_types.VerticalPodAutoscaler, *corev1.Pod, *vpa_types.RecommendedPodResources) {
 		mode := vpa_types.UpdateModeInPlaceOrRecreate
 		vpa := &vpa_types.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Generation: 3, Annotations: map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}}, Spec: vpa_types.VerticalPodAutoscalerSpec{UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode}}}
-		vpa.Status.ExternalOOMSignals = []vpa_types.ExternalOOMSignal{{Metric: "app_oom_total", PodName: "worker", PodUID: "uid-1", ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Minute)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 3}}
+		setExternalOOMSignals(t, vpa, []annotations.ExternalOOMSignal{{Metric: "app_oom_total", PodName: "worker", PodUID: "uid-1", ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Minute)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 3}})
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns", UID: "uid-1"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")}}}, {Name: "sidecar"}}}}
 		rec := &vpa_types.RecommendedPodResources{ContainerRecommendations: []vpa_types.RecommendedContainerResources{{ContainerName: "app", Target: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1200Mi")}}, {ContainerName: "sidecar", Target: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")}}}}
 		return vpa, pod, rec
@@ -70,10 +70,14 @@ func TestPrepareExternalOOMUpdate(t *testing.T) {
 			v.Generation++
 		}},
 		{"expired", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
-			v.Status.ExternalOOMSignals[0].ObservedAt = metav1.NewTime(now.Add(-11 * time.Minute))
+			signals := annotations.ParseExternalOOMSignals(v.Annotations)
+			signals[0].ObservedAt = metav1.NewTime(now.Add(-11 * time.Minute))
+			setExternalOOMSignals(t, v, signals)
 		}},
 		{"future", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
-			v.Status.ExternalOOMSignals[0].ObservedAt = metav1.NewTime(now.Add(time.Second))
+			signals := annotations.ParseExternalOOMSignals(v.Annotations)
+			signals[0].ObservedAt = metav1.NewTime(now.Add(time.Second))
+			setExternalOOMSignals(t, v, signals)
 		}},
 		{"request already increased", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
 			p.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1100Mi")
@@ -116,4 +120,11 @@ func TestPrepareExternalOOMUpdate(t *testing.T) {
 			require.Nil(t, PrepareExternalOOMUpdate(v, p, r, now))
 		})
 	}
+}
+
+func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []annotations.ExternalOOMSignal) {
+	t.Helper()
+	value, err := annotations.EncodeExternalOOMSignals(signals, vpa.Annotations)
+	require.NoError(t, err)
+	vpa.Annotations[annotations.ExternalOOMSignalsAnnotation] = value
 }

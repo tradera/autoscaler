@@ -38,41 +38,43 @@ func TestExternalOOMSignalLifecycle(t *testing.T) {
 	cluster := NewClusterState(time.Hour)
 	require.NoError(t, cluster.AddOrUpdateVpa(source, labels.Everything()))
 	v := cluster.VPAs()[VpaID{Namespace: "ns", VpaName: "vpa"}]
-	signal := vpa_types.ExternalOOMSignal{Metric: "app_oom_total", PodName: "worker", PodUID: "uid", ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Minute)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 1}
-	v.MergeExternalOOMSignals([]vpa_types.ExternalOOMSignal{signal, signal}, now)
-	require.Len(t, v.AsStatus().ExternalOOMSignals, 1)
-	require.Equal(t, signal.ObservedAt, v.AsStatus().ExternalOOMSignals[0].ObservedAt)
-	// Status is an independent copy, not an alias of retained model state.
-	exported := v.AsStatus()
-	exported.ExternalOOMSignals[0].MemoryRequest.Set(1)
-	require.Equal(t, "1Gi", v.AsStatus().ExternalOOMSignals[0].MemoryRequest.String())
-	// Restore only through the API status as a new recommender would.
-	source.Status = *v.AsStatus()
+	signal := annotations.ExternalOOMSignal{Metric: "app_oom_total", PodName: "worker", PodUID: "uid", ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Minute)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 1}
+	v.MergeExternalOOMSignals([]annotations.ExternalOOMSignal{signal, signal}, now)
+	require.Len(t, v.ExternalOOMSignals(), 1)
+	require.Equal(t, signal.ObservedAt, v.ExternalOOMSignals()[0].ObservedAt)
+	// Exported signals are an independent copy, not an alias of retained model state.
+	exported := v.ExternalOOMSignals()
+	exported[0].MemoryRequest.Set(1)
+	require.Equal(t, "1Gi", v.ExternalOOMSignals()[0].MemoryRequest.String())
+	// Restore only through the metadata annotation as a new recommender would.
+	value, err := annotations.EncodeExternalOOMSignals(v.ExternalOOMSignals(), source.Annotations)
+	require.NoError(t, err)
+	source.Annotations[annotations.ExternalOOMSignalsAnnotation] = value
 	restarted := NewClusterState(time.Hour)
 	require.NoError(t, restarted.AddOrUpdateVpa(source, labels.Everything()))
 	restored := restarted.VPAs()[v.ID]
-	require.Len(t, restored.AsStatus().ExternalOOMSignals, 1)
+	require.Len(t, restored.ExternalOOMSignals(), 1)
 	restored.MergeExternalOOMSignals(nil, now.Add(11*time.Minute))
-	require.Empty(t, restored.AsStatus().ExternalOOMSignals)
+	require.Empty(t, restored.ExternalOOMSignals())
 	source.Generation++
 	require.NoError(t, cluster.AddOrUpdateVpa(source, labels.Everything()))
-	require.Empty(t, v.AsStatus().ExternalOOMSignals)
+	require.Empty(t, v.ExternalOOMSignals())
 }
 
 func TestExternalOOMSignalsBoundedDeterministicAndOptOut(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	v := NewVpa(VpaID{}, labels.Everything(), now)
 	v.Annotations = map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}
-	var signals []vpa_types.ExternalOOMSignal
+	var signals []annotations.ExternalOOMSignal
 	for i := range 1200 {
-		signals = append(signals, vpa_types.ExternalOOMSignal{Metric: "app_oom_total", PodName: "worker", PodUID: types.UID(fmt.Sprint(i)), ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Duration(i) * time.Millisecond)), MemoryRequest: resource.MustParse("1Gi")})
+		signals = append(signals, annotations.ExternalOOMSignal{Metric: "app_oom_total", PodName: "worker", PodUID: types.UID(fmt.Sprint(i)), ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Duration(i) * time.Millisecond)), MemoryRequest: resource.MustParse("1Gi")})
 	}
 	v.MergeExternalOOMSignals(signals, now)
-	first := v.AsStatus().ExternalOOMSignals
+	first := v.ExternalOOMSignals()
 	require.Len(t, first, vpa_api_util.MaxExternalOOMSignals)
 	v.MergeExternalOOMSignals(signals, now)
-	require.Equal(t, first, v.AsStatus().ExternalOOMSignals)
+	require.Equal(t, first, v.ExternalOOMSignals())
 	v.Annotations = nil
 	v.MergeExternalOOMSignals(signals, now)
-	require.Empty(t, v.AsStatus().ExternalOOMSignals)
+	require.Empty(t, v.ExternalOOMSignals())
 }

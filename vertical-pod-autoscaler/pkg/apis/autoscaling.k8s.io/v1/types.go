@@ -21,7 +21,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -358,38 +357,12 @@ const (
 	ContainerControlledValuesRequestsOnly ContainerControlledValues = "RequestsOnly"
 )
 
-// ExternalOOMSignal identifies an accepted application OOM observation. It is
-// advisory evidence for expedited in-place memory updates, not a recommendation.
-type ExternalOOMSignal struct {
-	// Metric binds the observation to the configured counter selector.
-	// +kubebuilder:validation:MaxLength=1024
-	Metric        string      `json:"metric"`
-	PodName       string      `json:"podName"`
-	PodUID        types.UID   `json:"podUID"`
-	ContainerName string      `json:"containerName"`
-	ObservedAt    metav1.Time `json:"observedAt"`
-	// MemoryRequest is the request before the OOM. A subsequent increase consumes
-	// the signal, even if the recommendation continues rising.
-	MemoryRequest resource.Quantity `json:"memoryRequest"`
-	// ObservedGeneration binds the signal to the VPA policy that accepted it.
-	ObservedGeneration int64 `json:"observedGeneration"`
-}
-
 // VerticalPodAutoscalerStatus describes the runtime state of the autoscaler.
 type VerticalPodAutoscalerStatus struct {
 	// The most recently computed amount of resources recommended by the
 	// autoscaler for the controlled pods.
 	// +optional
 	Recommendation *RecommendedPodResources `json:"recommendation,omitempty"`
-	// ExternalOOMSignals are recent accepted application OOM observations.
-	// Signals expire after ten minutes and apply only to the exact pod UID and
-	// container. Older components may ignore this optional field.
-	// +optional
-	// +listType=map
-	// +listMapKey=podUID
-	// +listMapKey=containerName
-	// +kubebuilder:validation:MaxItems=128
-	ExternalOOMSignals []ExternalOOMSignal `json:"externalOOMSignals,omitempty"`
 	// Conditions is the set of conditions required for this autoscaler to scale its target,
 	// and indicates whether or not those conditions are met.
 	// +optional

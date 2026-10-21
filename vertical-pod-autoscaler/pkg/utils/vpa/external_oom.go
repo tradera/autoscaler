@@ -33,11 +33,11 @@ const (
 	// the native quick-OOM startup threshold.
 	ExternalOOMSignalLifetime = 10 * time.Minute
 	// MaxExternalOOMSignals bounds persisted and in-memory signal state per VPA.
-	MaxExternalOOMSignals = 128
+	MaxExternalOOMSignals = annotations.MaxExternalOOMSignals
 )
 
 // ValidExternalOOMSignal rejects incomplete, future or expired observations.
-func ValidExternalOOMSignal(signal vpa_types.ExternalOOMSignal, generation int64, now time.Time) bool {
+func ValidExternalOOMSignal(signal annotations.ExternalOOMSignal, generation int64, now time.Time) bool {
 	return signal.Metric != "" && len(signal.Metric) <= 1024 && signal.PodName != "" && signal.PodUID != "" && signal.ContainerName != "" &&
 		signal.MemoryRequest.Sign() > 0 && signal.ObservedGeneration == generation &&
 		!signal.ObservedAt.IsZero() && !signal.ObservedAt.After(now) &&
@@ -58,7 +58,7 @@ func PrepareExternalOOMUpdate(vpa *vpa_types.VerticalPodAutoscaler, pod *corev1.
 		return nil
 	}
 	signaled := make(map[string]bool)
-	for _, signal := range vpa.Status.ExternalOOMSignals {
+	for _, signal := range annotations.ParseExternalOOMSignals(vpa.Annotations) {
 		if signal.Metric != annotations.OOMCounterMetric(vpa.Annotations) || !ValidExternalOOMSignal(signal, vpa.Generation, now) || signal.PodUID != pod.UID || signal.PodName != pod.Name {
 			continue
 		}

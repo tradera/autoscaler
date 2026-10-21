@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	metrics_quality "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/quality"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -174,7 +175,7 @@ func (vpa *Vpa) updateRecommendationLocked(recommendation *vpa_types.Recommended
 // Vpa (Vertical Pod Autoscaler) object is responsible for vertical scaling of
 // Pods matching a given label selector.
 type Vpa struct {
-	externalOOMSignals []vpa_types.ExternalOOMSignal
+	externalOOMSignals []annotations.ExternalOOMSignal
 	ID                 VpaID
 	// Labels selector that determines which Pods are controlled by this VPA
 	// object. Can be nil, in which case no Pod is matched.
@@ -379,8 +380,7 @@ func (vpa *Vpa) AsStatus() *vpa_types.VerticalPodAutoscalerStatus {
 	vpa.mutex.RLock()
 	defer vpa.mutex.RUnlock()
 	status := &vpa_types.VerticalPodAutoscalerStatus{
-		Conditions:         vpa.conditions.AsList(),
-		ExternalOOMSignals: vpa.externalOOMSignalsLocked(time.Now()),
+		Conditions: vpa.conditions.AsList(),
 	}
 	if vpa.recommendation != nil {
 		status.Recommendation = vpa.recommendation
