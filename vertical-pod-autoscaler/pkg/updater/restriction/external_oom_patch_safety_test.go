@@ -28,6 +28,7 @@ import (
 	resource_updates "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
@@ -36,9 +37,9 @@ func TestExternalOOMFinalPatchSafety(t *testing.T) {
 	mode := vpa_types.UpdateModeInPlace
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns", UID: "uid"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}, Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}}}}}
 	vpa := &vpa_types.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Annotations: map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}}, Spec: vpa_types.VerticalPodAutoscalerSpec{UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode}}}
-	setExternalOOMSignals(t, vpa, []annotations.ExternalOOMSignal{{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: "app", ObservedAt: metav1.NewTime(now), MemoryRequest: resource.MustParse("1Gi")}})
+	signals := setExternalOOMSignals(t, vpa, []oomsignal.Signal{{MetricFingerprint: oomsignal.Fingerprint("app_oom_total"), PodName: pod.Name, PodUID: pod.UID, ContainerName: "app", ObservedAt: metav1.NewTime(now), MemoryRequest: resource.MustParse("1Gi")}})
 	rec := &vpa_types.RecommendedPodResources{ContainerRecommendations: []vpa_types.RecommendedContainerResources{{ContainerName: "app", Target: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1200Mi")}}}}
-	action := vpa_api_util.PrepareExternalOOMUpdate(vpa, pod, rec, now)
+	action := vpa_api_util.PrepareExternalOOMUpdate(vpa, pod, rec, signals, now)
 	require.NotNil(t, action)
 	for _, tc := range []struct {
 		name, path string

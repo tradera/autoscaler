@@ -30,6 +30,7 @@ import (
 	kube_client "k8s.io/client-go/kubernetes"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	resourceclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 
@@ -46,6 +47,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
@@ -179,7 +181,12 @@ func NewRecommenderController(
 
 	ignoredNamespaces := strings.Split(commonFlags.IgnoredVpaObjectNamespaces, ",")
 
+	var externalOOMRecorder record.EventRecorder
+	if promAPI != nil {
+		externalOOMRecorder = oomsignal.NewRecorder(ctx, kubeClient)
+	}
 	clusterStateFeeder := input.ClusterStateFeederFactory{
+		ExternalOOMRecorder: externalOOMRecorder,
 		PodLister:           podLister,
 		OOMObserver:         oomObserver,
 		MetricsClient:       input_metrics.NewMetricsClient(source, commonFlags.VpaObjectNamespace, "default-metrics-client"),

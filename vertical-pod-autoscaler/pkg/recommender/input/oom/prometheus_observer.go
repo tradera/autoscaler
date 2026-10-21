@@ -53,6 +53,7 @@ type clusterStateView interface {
 
 // podCtrKey is the per-(pod, container) key for tracked counter values.
 type podCtrKey struct {
+	vpaUID    types.UID
 	metric    string
 	uid       types.UID
 	pod       string
@@ -272,7 +273,7 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 			requests, _ := resourcehelpers.ContainerRequestsAndLimits(ctrName, pod)
 			liveMemory = model.ResourceAmount(requests.Memory().Value())
 		}
-		key := podCtrKey{pod: podName, container: ctrName, uid: uid, metric: selector}
+		key := podCtrKey{vpaUID: vpa.UID, pod: podName, container: ctrName, uid: uid, metric: selector}
 
 		o.mu.Lock()
 		previous, hadPrevious := vpaState[key]
@@ -325,6 +326,7 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 		ts := sample.Timestamp.Time().UTC()
 		for range count {
 			o.oomChan <- OomInfo{
+				VpaUID:        vpa.UID,
 				VpaID:         vpa.ID,
 				VpaGeneration: generation,
 				Metric:        selector,
@@ -351,7 +353,7 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 	// silently lose events on the next successful query.
 	o.mu.Lock()
 	for key := range vpaState {
-		if key.metric != selector {
+		if key.metric != selector || key.vpaUID != vpa.UID {
 			delete(vpaState, key)
 			continue
 		}

@@ -27,21 +27,22 @@ import (
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 )
 
 func TestPrepareExternalOOMUpdate(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
-	fixture := func() (*vpa_types.VerticalPodAutoscaler, *corev1.Pod, *vpa_types.RecommendedPodResources) {
+	fixture := func() (*vpa_types.VerticalPodAutoscaler, *corev1.Pod, *vpa_types.RecommendedPodResources, []oomsignal.Signal) {
 		mode := vpa_types.UpdateModeInPlaceOrRecreate
 		vpa := &vpa_types.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Generation: 3, Annotations: map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}}, Spec: vpa_types.VerticalPodAutoscalerSpec{UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode}}}
-		setExternalOOMSignals(t, vpa, []annotations.ExternalOOMSignal{{Metric: "app_oom_total", PodName: "worker", PodUID: "uid-1", ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Minute)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 3}})
+		signals := setExternalOOMSignals(t, vpa, []oomsignal.Signal{{MetricFingerprint: oomsignal.Fingerprint("app_oom_total"), PodName: "worker", PodUID: "uid-1", ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Minute)), MemoryRequest: resource.MustParse("1Gi"), ObservedGeneration: 3}})
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns", UID: "uid-1"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")}}}, {Name: "sidecar"}}}}
 		rec := &vpa_types.RecommendedPodResources{ContainerRecommendations: []vpa_types.RecommendedContainerResources{{ContainerName: "app", Target: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1200Mi")}}, {ContainerName: "sidecar", Target: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Mi")}}}}
-		return vpa, pod, rec
+		return vpa, pod, rec, signals
 	}
 	t.Run("memory only action preserves original", func(t *testing.T) {
-		vpa, pod, rec := fixture()
-		action := PrepareExternalOOMUpdate(vpa, pod, rec, now)
+		vpa, pod, rec, signals := fixture()
+		action := PrepareExternalOOMUpdate(vpa, pod, rec, signals, now)
 		require.NotNil(t, action)
 		require.Len(t, action.Status.Recommendation.ContainerRecommendations, 1)
 		target := action.Status.Recommendation.ContainerRecommendations[0].Target
@@ -55,80 +56,85 @@ func TestPrepareExternalOOMUpdate(t *testing.T) {
 	})
 	cases := []struct {
 		name   string
-		change func(*vpa_types.VerticalPodAutoscaler, *corev1.Pod, *vpa_types.RecommendedPodResources)
+		change func(*vpa_types.VerticalPodAutoscaler, *corev1.Pod, *vpa_types.RecommendedPodResources, []oomsignal.Signal)
 	}{
-		{"wrong uid", func(v *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"wrong uid", func(v *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			p.UID = "uid-2"
 		}},
-		{"wrong name", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"wrong name", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			p.Name = "other"
 		}},
-		{"wrong namespace", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"wrong namespace", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			p.Namespace = "other"
 		}},
-		{"stale generation", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"stale generation", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			v.Generation++
 		}},
-		{"expired", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
-			signals := annotations.ParseExternalOOMSignals(v.Annotations)
+		{"expired", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			signals[0].ObservedAt = metav1.NewTime(now.Add(-11 * time.Minute))
-			setExternalOOMSignals(t, v, signals)
 		}},
-		{"future", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
-			signals := annotations.ParseExternalOOMSignals(v.Annotations)
+		{"future", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			signals[0].ObservedAt = metav1.NewTime(now.Add(time.Second))
-			setExternalOOMSignals(t, v, signals)
 		}},
-		{"request already increased", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"request already increased", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			p.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1100Mi")
 		}},
-		{"desired request increased before status catches up", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"desired request increased before status catches up", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "app", Resources: &corev1.ResourceRequirements{Requests: p.Spec.Containers[0].Resources.Requests.DeepCopy()}}}
 			p.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = resource.MustParse("1100Mi")
 		}},
-		{"no increase", func(_ *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, r *vpa_types.RecommendedPodResources) {
+		{"no increase", func(_ *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, r *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			r.ContainerRecommendations[0].Target[corev1.ResourceMemory] = resource.MustParse("1Gi")
 		}},
-		{"decrease", func(_ *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, r *vpa_types.RecommendedPodResources) {
+		{"decrease", func(_ *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, r *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			r.ContainerRecommendations[0].Target[corev1.ResourceMemory] = resource.MustParse("512Mi")
 		}},
-		{"recreate", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"recreate", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			mode := vpa_types.UpdateModeRecreate
 			v.Spec.UpdatePolicy.UpdateMode = &mode
 		}},
-		{"cpu boost owned by boost worker", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"cpu boost owned by boost worker", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			p.Annotations = map[string]string{annotations.GetStartupCPUBoostAnnotationKey("sidecar"): "{}"}
 		}},
-		{"changed metric", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"changed metric", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			v.Annotations[annotations.OOMCounterMetricAnnotation] = "different_metric"
 		}},
-		{"unobserved container", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"unobserved container", func(_ *vpa_types.VerticalPodAutoscaler, p *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			p.Annotations = map[string]string{annotations.VpaObservedContainersLabel: "sidecar"}
 		}},
-		{"opt out", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"opt out", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			v.Annotations = nil
 		}},
-		{"container off", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"container off", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			off := vpa_types.ContainerScalingModeOff
 			v.Spec.ResourcePolicy = &vpa_types.PodResourcePolicy{ContainerPolicies: []vpa_types.ContainerResourcePolicy{{ContainerName: "app", Mode: &off}}}
 		}},
-		{"memory uncontrolled", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources) {
+		{"memory uncontrolled", func(v *vpa_types.VerticalPodAutoscaler, _ *corev1.Pod, _ *vpa_types.RecommendedPodResources, signals []oomsignal.Signal) {
 			cpu := []corev1.ResourceName{corev1.ResourceCPU}
 			v.Spec.ResourcePolicy = &vpa_types.PodResourcePolicy{ContainerPolicies: []vpa_types.ContainerResourcePolicy{{ContainerName: "app", ControlledResources: &cpu}}}
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			v, p, r := fixture()
-			tc.change(v, p, r)
-			require.Nil(t, PrepareExternalOOMUpdate(v, p, r, now))
+			v, p, r, signals := fixture()
+			tc.change(v, p, r, signals)
+			require.Nil(t, PrepareExternalOOMUpdate(v, p, r, signals, now))
 		})
 	}
 }
 
-func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []annotations.ExternalOOMSignal) {
+func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []oomsignal.Signal) []oomsignal.Signal {
 	t.Helper()
-	value, err := annotations.EncodeExternalOOMSignals(signals, vpa.Annotations)
-	require.NoError(t, err)
-	vpa.Annotations[annotations.ExternalOOMSignalsAnnotation] = value
+	if vpa.Name == "" {
+		vpa.Name = "vpa"
+	}
+	if vpa.UID == "" {
+		vpa.UID = "vpa-uid"
+	}
+	for i := range signals {
+		signals[i].Namespace = vpa.Namespace
+		signals[i].VPAName = vpa.Name
+		signals[i].VPAUID = vpa.UID
+	}
+	return signals
 }

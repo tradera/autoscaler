@@ -53,6 +53,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/restriction"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/utils"
 	metrics_updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/updater"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/status"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -85,6 +86,9 @@ type Updater interface {
 }
 
 type updater struct {
+	externalOOMClient            kube_client.Interface
+	externalOOMNamespace         string
+	externalOOMSignals           map[types.UID][]oomsignal.Signal
 	vpaLister                    vpa_lister.VerticalPodAutoscalerLister
 	podLister                    listersv1.PodLister
 	eventRecorder                record.EventRecorder
@@ -148,6 +152,7 @@ func NewUpdater(
 	)
 
 	u := &updater{
+		externalOOMClient: kubeClient, externalOOMNamespace: namespace,
 		vpaLister:                    vpa_api_util.NewVpasLister(vpaClient, make(chan struct{}), namespace),
 		podLister:                    podInformerFactory.Core().V1().Pods().Lister(),
 		eventRecorder:                newEventRecorder(kubeClient),
@@ -257,6 +262,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 		return
 	}
 
+	u.externalOOMSignals = u.readExternalOOMEvents(ctx, vpas)
 	podsList, err := u.podLister.List(labels.Everything())
 	if err != nil {
 		klog.ErrorS(err, "Failed to get pods list")
@@ -366,7 +372,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 
 		for _, update := range podsForInPlace {
 			pod, actionVPA := update.Pod, update.VPA
-			if update.ExternalOOM && vpa_api_util.PrepareExternalOOMUpdate(actionVPA, pod, actionVPA.Status.Recommendation, time.Now()) == nil {
+			if update.ExternalOOM && vpa_api_util.PrepareExternalOOMUpdate(actionVPA, pod, actionVPA.Status.Recommendation, update.ExternalOOMSignals, time.Now()) == nil {
 				continue
 			}
 			decision := inPlaceLimiter.CanInPlaceUpdate(pod, actionVPA, u.infeasibleAttempts)
@@ -418,7 +424,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 				metrics_updater.RecordFailedInPlaceUpdate(vpaSize, vpa.Name, vpa.Namespace, "InPlaceUpdateRateLimiterWaitFailed")
 				return
 			}
-			if update.ExternalOOM && vpa_api_util.PrepareExternalOOMUpdate(actionVPA, pod, actionVPA.Status.Recommendation, time.Now()) == nil {
+			if update.ExternalOOM && vpa_api_util.PrepareExternalOOMUpdate(actionVPA, pod, actionVPA.Status.Recommendation, update.ExternalOOMSignals, time.Now()) == nil {
 				continue
 			}
 			err := inPlaceLimiter.InPlaceUpdate(pod, actionVPA, u.eventRecorder)
@@ -699,6 +705,7 @@ func getRateLimiter(rateLimit float64, rateLimitBurst int) *rate.Limiter {
 // getPodsUpdateOrder returns list of pods that should be updated ordered by update priority
 func (u *updater) getPodsUpdateOrder(pods []*corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler) []priority.PodUpdate {
 	updateconfig := priority.UpdateConfig{
+		ExternalOOMSignals:         u.externalOOMSignals[vpa.UID],
 		MinChangePriority:          u.defaultUpdateThreshold,
 		PodLifetimeUpdateThreshold: u.podLifetimeUpdateThreshold,
 		EvictAfterOOMThreshold:     u.evictAfterOOMThreshold,

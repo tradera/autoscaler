@@ -29,7 +29,6 @@ import (
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
-	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	vpa_utils "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
@@ -386,7 +385,7 @@ func (cluster *clusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	vpa.SetResourcePolicy(apiObject.Spec.ResourcePolicy)
 	vpa.SetAPIVersion(apiObject.GetObjectKind().GroupVersionKind().Version)
 	vpa.Generation = apiObject.Generation
-	vpa.MergeExternalOOMSignals(annotations.ParseExternalOOMSignals(apiObject.Annotations), time.Now())
+	vpa.UID = apiObject.UID
 	return nil
 }
 

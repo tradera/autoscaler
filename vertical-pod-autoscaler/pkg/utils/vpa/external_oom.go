@@ -24,31 +24,17 @@ import (
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	resourcehelpers "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/resources"
 )
 
-const (
-	externalOOMActionUIDAnnotation = "external.vpa.k8s.io/quick-update-pod-uid"
-	// ExternalOOMSignalLifetime bounds expedited eligibility, independently of
-	// the native quick-OOM startup threshold.
-	ExternalOOMSignalLifetime = 10 * time.Minute
-	// MaxExternalOOMSignals bounds persisted and in-memory signal state per VPA.
-	MaxExternalOOMSignals = annotations.MaxExternalOOMSignals
-)
-
-// ValidExternalOOMSignal rejects incomplete, future or expired observations.
-func ValidExternalOOMSignal(signal annotations.ExternalOOMSignal, generation int64, now time.Time) bool {
-	return signal.Metric != "" && len(signal.Metric) <= 1024 && signal.PodName != "" && signal.PodUID != "" && signal.ContainerName != "" &&
-		signal.MemoryRequest.Sign() > 0 && signal.ObservedGeneration == generation &&
-		!signal.ObservedAt.IsZero() && !signal.ObservedAt.After(now) &&
-		now.Sub(signal.ObservedAt.Time) < ExternalOOMSignalLifetime
-}
+const externalOOMActionUIDAnnotation = "external.vpa.k8s.io/quick-update-pod-uid"
 
 // PrepareExternalOOMUpdate builds a per-action VPA, preserving policy while
 // freezing all resources except increasing memory for signaled containers.
 // The caller must carry this snapshot through admission and resize execution;
 // re-reading the ordinary cohort recommendation would allow unrelated downsizes.
-func PrepareExternalOOMUpdate(vpa *vpa_types.VerticalPodAutoscaler, pod *corev1.Pod, processed *vpa_types.RecommendedPodResources, now time.Time) *vpa_types.VerticalPodAutoscaler {
+func PrepareExternalOOMUpdate(vpa *vpa_types.VerticalPodAutoscaler, pod *corev1.Pod, processed *vpa_types.RecommendedPodResources, signals []oomsignal.Signal, now time.Time) *vpa_types.VerticalPodAutoscaler {
 	if vpa == nil || pod == nil || processed == nil || pod.UID == "" ||
 		pod.Namespace != vpa.Namespace || annotations.OOMCounterMetric(vpa.Annotations) == "" || PodHasCPUBoostInProgressAnnotation(pod) {
 		return nil
@@ -58,8 +44,9 @@ func PrepareExternalOOMUpdate(vpa *vpa_types.VerticalPodAutoscaler, pod *corev1.
 		return nil
 	}
 	signaled := make(map[string]bool)
-	for _, signal := range annotations.ParseExternalOOMSignals(vpa.Annotations) {
-		if signal.Metric != annotations.OOMCounterMetric(vpa.Annotations) || !ValidExternalOOMSignal(signal, vpa.Generation, now) || signal.PodUID != pod.UID || signal.PodName != pod.Name {
+	fingerprint := oomsignal.Fingerprint(annotations.OOMCounterMetric(vpa.Annotations))
+	for _, signal := range signals {
+		if signal.MetricFingerprint != fingerprint || !signal.Valid(now) || signal.ObservedGeneration != vpa.Generation || signal.VPAUID != vpa.UID || signal.VPAName != vpa.Name || signal.Namespace != vpa.Namespace || signal.PodUID != pod.UID || signal.PodName != pod.Name {
 			continue
 		}
 		container := getContainer(signal.ContainerName, pod)

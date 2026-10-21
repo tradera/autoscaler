@@ -32,6 +32,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/inplace"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -56,9 +57,9 @@ func TestExternalOOMResizePreconditions(t *testing.T) {
 			mode := vpa_types.UpdateModeInPlaceOrRecreate
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns", UID: "uid"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("1Gi")}, Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("2Gi")}}}}}}
 			vpa := &vpa_types.VerticalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Annotations: map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}}, Spec: vpa_types.VerticalPodAutoscalerSpec{UpdatePolicy: &vpa_types.PodUpdatePolicy{UpdateMode: &mode}}}
-			setExternalOOMSignals(t, vpa, []annotations.ExternalOOMSignal{{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Second)), MemoryRequest: resource.MustParse("1Gi")}})
+			signals := setExternalOOMSignals(t, vpa, []oomsignal.Signal{{MetricFingerprint: oomsignal.Fingerprint("app_oom_total"), PodName: pod.Name, PodUID: pod.UID, ContainerName: "app", ObservedAt: metav1.NewTime(now.Add(-time.Second)), MemoryRequest: resource.MustParse("1Gi")}})
 			resources := &vpa_types.RecommendedPodResources{ContainerRecommendations: []vpa_types.RecommendedContainerResources{{ContainerName: "app", Target: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1200Mi")}}}}
-			action := vpa_api_util.PrepareExternalOOMUpdate(vpa, pod, resources, now)
+			action := vpa_api_util.PrepareExternalOOMUpdate(vpa, pod, resources, signals, now)
 			require.NotNil(t, action)
 			actual := pod.DeepCopy()
 			tc.mutate(actual)
@@ -84,9 +85,18 @@ func TestExternalOOMResizePreconditions(t *testing.T) {
 	}
 }
 
-func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []annotations.ExternalOOMSignal) {
+func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []oomsignal.Signal) []oomsignal.Signal {
 	t.Helper()
-	value, err := annotations.EncodeExternalOOMSignals(signals, vpa.Annotations)
-	require.NoError(t, err)
-	vpa.Annotations[annotations.ExternalOOMSignalsAnnotation] = value
+	if vpa.Name == "" {
+		vpa.Name = "vpa"
+	}
+	if vpa.UID == "" {
+		vpa.UID = "vpa-uid"
+	}
+	for i := range signals {
+		signals[i].Namespace = vpa.Namespace
+		signals[i].VPAName = vpa.Name
+		signals[i].VPAUID = vpa.UID
+	}
+	return signals
 }

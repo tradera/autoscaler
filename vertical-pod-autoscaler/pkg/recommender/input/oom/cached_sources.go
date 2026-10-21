@@ -58,7 +58,7 @@ func (o *PrometheusObserver) sourceVPAs() map[model.VpaID]*model.Vpa {
 			continue
 		}
 		id := model.VpaID{Namespace: source.Namespace, VpaName: source.Name}
-		result[id] = &model.Vpa{ID: id, Annotations: maps.Clone(source.Annotations), Generation: source.Generation}
+		result[id] = &model.Vpa{UID: source.UID, ID: id, Annotations: maps.Clone(source.Annotations), Generation: source.Generation}
 	}
 	return result
 }

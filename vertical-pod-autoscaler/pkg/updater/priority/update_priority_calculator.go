@@ -31,6 +31,7 @@ import (
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	resourcehelpers "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/resources"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
@@ -50,6 +51,7 @@ type UpdatePriorityCalculator struct {
 
 // UpdateConfig holds configuration for UpdatePriorityCalculator
 type UpdateConfig struct {
+	ExternalOOMSignals []oomsignal.Signal
 	// MinChangePriority is the minimum change priority that will trigger a update.
 	// TODO: should have separate for Mem and CPU?
 	MinChangePriority          float64
@@ -83,7 +85,7 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *corev1.Pod, now time.Time, inf
 
 	actionVPA := calc.vpa
 	externalOOM := false
-	if action := vpa_api_util.PrepareExternalOOMUpdate(calc.vpa, pod, processedRecommendation, now); action != nil {
+	if action := vpa_api_util.PrepareExternalOOMUpdate(calc.vpa, pod, processedRecommendation, calc.config.ExternalOOMSignals, now); action != nil {
 		actionVPA = action
 		processedRecommendation = action.Status.Recommendation
 		externalOOM = true
@@ -183,9 +185,10 @@ func (calc *UpdatePriorityCalculator) GetSortedPods(admission PodEvictionAdmissi
 // PodUpdate carries the exact per-pod VPA used for admission through execution.
 // ExternalOOM updates must never fall back to eviction.
 type PodUpdate struct {
-	Pod         *corev1.Pod
-	VPA         *vpa_types.VerticalPodAutoscaler
-	ExternalOOM bool
+	ExternalOOMSignals []oomsignal.Signal
+	Pod                *corev1.Pod
+	VPA                *vpa_types.VerticalPodAutoscaler
+	ExternalOOM        bool
 }
 
 // GetSortedPodUpdates returns admitted actions, including their scoped policy.
@@ -218,7 +221,7 @@ func (calc *UpdatePriorityCalculator) GetSortedPodUpdates(admission PodEvictionA
 			}
 		}
 		if admission.Admit(podPrio.pod, admissionRecommendation) {
-			result = append(result, PodUpdate{Pod: podPrio.pod, VPA: podPrio.vpa, ExternalOOM: podPrio.externalOOM})
+			result = append(result, PodUpdate{Pod: podPrio.pod, VPA: podPrio.vpa, ExternalOOM: podPrio.externalOOM, ExternalOOMSignals: calc.config.ExternalOOMSignals})
 		} else {
 			klog.V(2).InfoS("Pod removed from update queue by PodEvictionAdmission", "pod", klog.KObj(podPrio.pod))
 		}

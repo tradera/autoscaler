@@ -27,7 +27,7 @@ import (
 
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/oom"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
-	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 )
 
 func (feeder *clusterStateFeeder) recordOOM(info oom.OomInfo) error {
@@ -35,7 +35,7 @@ func (feeder *clusterStateFeeder) recordOOM(info oom.OomInfo) error {
 		return feeder.clusterState.RecordOOM(info.ContainerID, info.Timestamp, info.Memory)
 	}
 	vpa, found := feeder.clusterState.VPAs()[info.VpaID]
-	if !found || vpa.Generation != info.VpaGeneration || annotations.OOMCounterMetric(vpa.Annotations) == "" || info.Metric != annotations.OOMCounterMetric(vpa.Annotations) || feeder.podLister == nil {
+	if !found || info.VpaUID == "" || vpa.UID != info.VpaUID || vpa.Generation != info.VpaGeneration || annotations.OOMCounterMetric(vpa.Annotations) == "" || info.Metric != annotations.OOMCounterMetric(vpa.Annotations) || feeder.podLister == nil {
 		return errors.New("external OOM source is no longer active")
 	}
 	pod, err := feeder.podLister.Pods(info.ContainerID.Namespace).Get(info.ContainerID.PodName)
@@ -45,9 +45,10 @@ func (feeder *clusterStateFeeder) recordOOM(info oom.OomInfo) error {
 	if pod.UID != info.PodUID || pod.Namespace != vpa.ID.Namespace || !vpa.PodSelector.Matches(labels.Set(pod.Labels)) {
 		return errors.New("external OOM pod identity or ownership changed")
 	}
-	signal := annotations.ExternalOOMSignal{
-		Metric:  info.Metric,
-		PodName: pod.Name, PodUID: pod.UID, ContainerName: info.ContainerID.ContainerName,
+	signal := oomsignal.Signal{
+		Namespace: vpa.ID.Namespace, VPAName: vpa.ID.VpaName, VPAUID: vpa.UID,
+		MetricFingerprint: oomsignal.Fingerprint(info.Metric),
+		PodName:           pod.Name, PodUID: pod.UID, ContainerName: info.ContainerID.ContainerName,
 		ObservedAt: metav1.NewTime(info.Timestamp), MemoryRequest: *resource.NewQuantity(int64(info.Memory), resource.BinarySI),
 		ObservedGeneration: info.VpaGeneration,
 	}
@@ -60,10 +61,12 @@ func (feeder *clusterStateFeeder) recordOOM(info oom.OomInfo) error {
 	}
 	// Signal retention is deliberately narrower than the histogram window.
 	// Ineligible quick-update evidence must not suppress ordinary OOM sizing.
-	if !vpa_api_util.ValidExternalOOMSignal(signal, vpa.Generation, now) {
+	if !signal.Valid(now) {
 		return nil
 	}
-	vpa.MergeExternalOOMSignals([]annotations.ExternalOOMSignal{signal}, now)
+	if err := oomsignal.Record(feeder.externalOOMRecorder, signal); err != nil {
+		klog.ErrorS(err, "Cannot emit accepted external OOM Event", "pod", klog.KObj(pod))
+	}
 	klog.V(2).InfoS("Accepted external OOM observation", "pod", klog.KObj(pod), "container", info.ContainerID.ContainerName, "vpa", vpa.ID.VpaName)
 	return nil
 }

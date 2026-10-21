@@ -36,6 +36,7 @@ import (
 func TestPrometheusObserverIdentityAndMetricChangesEstablishBaseline(t *testing.T) {
 	now := time.Now()
 	vpa := vpaWithOOMAnnotation("ns", "vpa", "app_oom_total")
+	vpa.UID = "original-vpa"
 	cs := &fakeClusterState{vpas: map[model.VpaID]*model.Vpa{vpa.ID: vpa}, pods: map[model.PodID]*model.PodState{}}
 	p := podWithMemRequest("ns", "worker", "app", 1024*1024*1024)
 	cs.pods[p.ID] = p
@@ -44,7 +45,7 @@ func TestPrometheusObserverIdentityAndMetricChangesEstablishBaseline(t *testing.
 	pod.Spec.Containers = []corev1.Container{{Name: "app", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}}}}
 	require.NoError(t, indexer.Add(pod))
 	var results []prommodel.Value
-	for _, value := range []float64{1, 2, 5, 6, 99, 100} {
+	for _, value := range []float64{1, 2, 5, 6, 99, 100, 101, 102} {
 		results = append(results, prommodel.Vector{sample("worker", "app", value, now)})
 	}
 	api := &fakeAPI{results: results}
@@ -57,6 +58,7 @@ func TestPrometheusObserverIdentityAndMetricChangesEstablishBaseline(t *testing.
 	event := <-ch
 	require.Equal(t, pod.UID, event.PodUID)
 	require.Equal(t, vpa.ID, event.VpaID)
+	require.Equal(t, vpa.UID, event.VpaUID)
 	require.Equal(t, "app_oom_total", event.Metric)
 	replacement := pod.DeepCopy()
 	replacement.UID = "new"
@@ -73,5 +75,11 @@ func TestPrometheusObserverIdentityAndMetricChangesEstablishBaseline(t *testing.
 	observer.pollOnce(context.Background())
 	require.Len(t, ch, 1)
 	require.Equal(t, "other_oom_total", (<-ch).Metric)
+	vpa.UID = "replacement-vpa"
+	observer.pollOnce(context.Background())
+	require.Empty(t, ch, "a replacement VPA must establish a baseline even with unchanged selector and pod")
+	observer.pollOnce(context.Background())
+	require.Len(t, ch, 1)
+	require.Equal(t, vpa.UID, (<-ch).VpaUID)
 	require.Len(t, observer.values[vpa.ID], 1)
 }

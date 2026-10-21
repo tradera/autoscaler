@@ -32,9 +32,10 @@ import (
 
 // OomInfo contains data of the OOM event occurrence
 type OomInfo struct {
-	// External observations carry provenance for the updater status signal.
+	// External observations carry provenance for the advisory updater Event.
 	// Empty PodUID leaves legacy observations on the histogram-only path.
 	Metric        string
+	VpaUID        types.UID
 	VpaID         model.VpaID
 	VpaGeneration int64
 	PodUID        types.UID

@@ -55,6 +55,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/utils"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/status"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
@@ -350,13 +351,21 @@ func testRunOnceBase(
 	podLister := &test.PodListerMock{}
 	podLister.On("List").Return(pods, nil)
 
+	externalEvents := fake.NewClientset()
 	vpaObj.Spec.UpdatePolicy = &vpa_types.PodUpdatePolicy{UpdateMode: &updateMode}
 	if len(externalOOM) > 0 && externalOOM[0] {
 		vpaObj.Namespace = "default"
+		vpaObj.UID = "vpa-uid"
+		if vpaObj.Name == "" {
+			vpaObj.Name = "vpa"
+		}
 		vpaObj.Annotations = map[string]string{annotations.OOMCounterMetricAnnotation: "app_oom_total"}
 		for _, pod := range pods {
 			pod.UID = types.UID(pod.Name)
-			setExternalOOMSignals(t, vpaObj, append(annotations.ParseExternalOOMSignals(vpaObj.Annotations), annotations.ExternalOOMSignal{Metric: "app_oom_total", PodName: pod.Name, PodUID: pod.UID, ContainerName: containerName, ObservedAt: metav1.NewTime(time.Now().Add(-time.Second)), MemoryRequest: resource.MustParse("100M")}))
+			event, err := oomsignal.Event(oomsignal.Signal{Namespace: vpaObj.Namespace, VPAName: vpaObj.Name, VPAUID: vpaObj.UID, MetricFingerprint: oomsignal.Fingerprint("app_oom_total"), PodName: pod.Name, PodUID: pod.UID, ContainerName: containerName, ObservedAt: metav1.NewTime(time.Now().Add(-time.Second)), MemoryRequest: resource.MustParse("100M"), ObservedGeneration: vpaObj.Generation})
+			require.NoError(t, err)
+			_, err = externalEvents.CoreV1().Events(vpaObj.Namespace).Create(t.Context(), event, metav1.CreateOptions{})
+			require.NoError(t, err)
 		}
 		inplace.check = func(action *vpa_types.VerticalPodAutoscaler) {
 			require.Len(t, action.Status.Recommendation.ContainerRecommendations, 1)
@@ -378,6 +387,7 @@ func testRunOnceBase(
 	mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
 
 	updater := &updater{
+		externalOOMClient:            externalEvents,
 		vpaLister:                    vpaLister,
 		podLister:                    podLister,
 		restrictionFactory:           factory,
@@ -1199,11 +1209,4 @@ func TestProcessNextBoostItem_RetryExhaustion_ThenResync(t *testing.T) {
 	assert.True(t, u.processNextBoostItem(ctx))
 	inplace.AssertNumberOfCalls(t, "InPlaceUpdate", 1)
 	assert.Equal(t, 0, queue.Len(), "queue should be empty after successful unboost")
-}
-
-func setExternalOOMSignals(t *testing.T, vpa *vpa_types.VerticalPodAutoscaler, signals []annotations.ExternalOOMSignal) {
-	t.Helper()
-	value, err := annotations.EncodeExternalOOMSignals(signals, vpa.Annotations)
-	require.NoError(t, err)
-	vpa.Annotations[annotations.ExternalOOMSignalsAnnotation] = value
 }
