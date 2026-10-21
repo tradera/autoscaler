@@ -4,9 +4,11 @@ on:
   push:
     paths:
       - 'vertical-pod-autoscaler/charts/**'
+      - '.github/workflows/vpa-helm-unittest.yaml'
   pull_request:
     paths:
       - 'vertical-pod-autoscaler/charts/**'
+      - '.github/workflows/vpa-helm-unittest.yaml'
 
 permissions:
   contents: read
