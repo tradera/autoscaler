@@ -31,6 +31,8 @@ import (
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/oomsignal"
+	resourcehelpers "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/resources"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 )
 
@@ -49,6 +51,7 @@ type UpdatePriorityCalculator struct {
 
 // UpdateConfig holds configuration for UpdatePriorityCalculator
 type UpdateConfig struct {
+	ExternalOOMSignals []oomsignal.Signal
 	// MinChangePriority is the minimum change priority that will trigger a update.
 	// TODO: should have separate for Mem and CPU?
 	MinChangePriority          float64
@@ -78,6 +81,14 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *corev1.Pod, now time.Time, inf
 	if err != nil {
 		klog.V(2).ErrorS(err, "Cannot process recommendation for pod", "pod", klog.KObj(pod))
 		return
+	}
+
+	actionVPA := calc.vpa
+	externalOOM := false
+	if action := vpa_api_util.PrepareExternalOOMUpdate(calc.vpa, pod, processedRecommendation, calc.config.ExternalOOMSignals, now); action != nil {
+		actionVPA = action
+		processedRecommendation = action.Status.Recommendation
+		externalOOM = true
 	}
 
 	// Check if this recommendation was already tried and failed as infeasible
@@ -131,7 +142,7 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *corev1.Pod, now time.Time, inf
 	// - the request is outside the recommended range for some container.
 	// - the pod lives for at least the duration of PodLifetimeUpdateThreshold and the resource diff is >= MinChangePriority.
 	// - a vpa scaled container OOMed in less than evictAfterOOMThreshold of startup, and that OOM is still within evictAfterOOMThreshold of now.
-	if !updatePriority.OutsideRecommendedRange && !quickOOM {
+	if !updatePriority.OutsideRecommendedRange && !quickOOM && !externalOOM {
 		if pod.Status.StartTime == nil {
 			// TODO: Set proper condition on the VPA.
 			klog.V(4).InfoS("Not updating pod, missing field pod.Status.StartTime", "pod", klog.KObj(pod))
@@ -156,11 +167,32 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *corev1.Pod, now time.Time, inf
 	calc.pods = append(calc.pods, prioritizedPod{
 		pod:            pod,
 		priority:       updatePriority,
-		recommendation: processedRecommendation})
+		recommendation: processedRecommendation,
+		vpa:            actionVPA,
+		externalOOM:    externalOOM})
 }
 
 // GetSortedPods returns a list of pods ordered by update priority (highest update priority first)
 func (calc *UpdatePriorityCalculator) GetSortedPods(admission PodEvictionAdmission) []*corev1.Pod {
+	updates := calc.GetSortedPodUpdates(admission)
+	result := make([]*corev1.Pod, 0, len(updates))
+	for _, update := range updates {
+		result = append(result, update.Pod)
+	}
+	return result
+}
+
+// PodUpdate carries the exact per-pod VPA used for admission through execution.
+// ExternalOOM updates must never fall back to eviction.
+type PodUpdate struct {
+	ExternalOOMSignals []oomsignal.Signal
+	Pod                *corev1.Pod
+	VPA                *vpa_types.VerticalPodAutoscaler
+	ExternalOOM        bool
+}
+
+// GetSortedPodUpdates returns admitted actions, including their scoped policy.
+func (calc *UpdatePriorityCalculator) GetSortedPodUpdates(admission PodEvictionAdmission) []PodUpdate {
 	slices.SortFunc(calc.pods, func(a, b prioritizedPod) int {
 		if b.priority.Less(a.priority) {
 			return -1
@@ -171,10 +203,25 @@ func (calc *UpdatePriorityCalculator) GetSortedPods(admission PodEvictionAdmissi
 		return 0
 	})
 
-	result := []*corev1.Pod{}
+	result := []PodUpdate{}
 	for _, podPrio := range calc.pods {
-		if admission.Admit(podPrio.pod, podPrio.recommendation) {
-			result = append(result, podPrio.pod)
+		admissionRecommendation := podPrio.recommendation
+		if podPrio.externalOOM {
+			// Admission compares complete resulting requests. An omitted CPU
+			// target means unchanged, not zero; keep the resize snapshot sparse.
+			admissionRecommendation = podPrio.recommendation.DeepCopy()
+			for i := range admissionRecommendation.ContainerRecommendations {
+				rec := &admissionRecommendation.ContainerRecommendations[i]
+				requests, _ := resourcehelpers.ContainerRequestsAndLimits(rec.ContainerName, podPrio.pod)
+				for resourceName, request := range requests {
+					if _, changed := rec.Target[resourceName]; !changed {
+						rec.Target[resourceName] = request.DeepCopy()
+					}
+				}
+			}
+		}
+		if admission.Admit(podPrio.pod, admissionRecommendation) {
+			result = append(result, PodUpdate{Pod: podPrio.pod, VPA: podPrio.vpa, ExternalOOM: podPrio.externalOOM, ExternalOOMSignals: calc.config.ExternalOOMSignals})
 		} else {
 			klog.V(2).InfoS("Pod removed from update queue by PodEvictionAdmission", "pod", klog.KObj(podPrio.pod))
 		}
@@ -287,6 +334,8 @@ func hasLowerResourceRecommendation(lastAttempt, newRecommendation *vpa_types.Re
 }
 
 type prioritizedPod struct {
+	vpa            *vpa_types.VerticalPodAutoscaler
+	externalOOM    bool
 	pod            *corev1.Pod
 	priority       PodPriority
 	recommendation *vpa_types.RecommendedPodResources

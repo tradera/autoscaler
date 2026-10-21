@@ -34,6 +34,7 @@ import (
 	kube_client "k8s.io/client-go/kubernetes"
 	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -90,6 +91,7 @@ type ClusterStateFeederFactory struct {
 	VpaCheckpointLister vpa_lister.VerticalPodAutoscalerCheckpointLister
 	VpaLister           vpa_lister.VerticalPodAutoscalerLister
 	PodLister           listersv1.PodLister
+	ExternalOOMRecorder record.EventRecorder
 	OOMObserver         oom.Observer
 	SelectorFetcher     target.VpaTargetSelectorFetcher
 	MemorySaveMode      bool
@@ -118,6 +120,7 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 	return &clusterStateFeeder{
 		perVPABackfiller:    backfiller,
 		metricsClient:       m.MetricsClient,
+		externalOOMRecorder: m.ExternalOOMRecorder,
 		oomChan:             m.OOMObserver.GetObservedOomsChannel(),
 		vpaCheckpointClient: m.VpaCheckpointClient,
 		vpaCheckpointLister: m.VpaCheckpointLister,
@@ -233,6 +236,7 @@ func NewPodListerAndOOMObserver(ctx context.Context, kubeClient kube_client.Inte
 }
 
 type clusterStateFeeder struct {
+	externalOOMRecorder record.EventRecorder
 	specClient          spec.SpecClient
 	metricsClient       metrics.MetricsClient
 	podLister           listersv1.PodLister
@@ -735,7 +739,7 @@ Loop:
 		select {
 		case oomInfo := <-feeder.oomChan:
 			klog.V(3).InfoS("OOM detected", "oomInfo", oomInfo)
-			if err = feeder.clusterState.RecordOOM(oomInfo.ContainerID, oomInfo.Timestamp, oomInfo.Memory); err != nil {
+			if err = feeder.recordOOM(oomInfo); err != nil {
 				klog.V(0).InfoS("Failed to record OOM", "oomInfo", oomInfo, "error", err)
 			}
 		default:

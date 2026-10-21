@@ -25,11 +25,15 @@ import (
 
 	prometheusv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	prommodel "github.com/prometheus/common/model"
+	"k8s.io/apimachinery/pkg/types"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 
+	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
 	metrics_recommender "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/recommender"
+	resourcehelpers "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/resources"
 )
 
 // promQueryAPI is the slice of the Prometheus v1 API that this observer
@@ -49,6 +53,9 @@ type clusterStateView interface {
 
 // podCtrKey is the per-(pod, container) key for tracked counter values.
 type podCtrKey struct {
+	vpaUID    types.UID
+	metric    string
+	uid       types.UID
 	pod       string
 	container string
 }
@@ -76,13 +83,17 @@ type podCtrKey struct {
 // Observer is a Kubernetes event/informer pattern, while this is a
 // timer-driven poller. They coexist by writing to the same OomInfo channel.
 type PrometheusObserver struct {
-	promAPI        promQueryAPI
-	clusterState   clusterStateView
-	oomChan        chan<- OomInfo
-	pollInterval   time.Duration
-	queryTimeout   time.Duration
-	podLabel       string
-	containerLabel string
+	promAPI           promQueryAPI
+	podLister         listersv1.PodLister
+	vpaLister         vpa_lister.VerticalPodAutoscalerLister
+	recommenderName   string
+	ignoredNamespaces []string
+	clusterState      clusterStateView
+	oomChan           chan<- OomInfo
+	pollInterval      time.Duration
+	queryTimeout      time.Duration
+	podLabel          string
+	containerLabel    string
 
 	// values holds the most recent counter value observed for each
 	// (VPA, pod, container). The first observation of a pod establishes
@@ -94,6 +105,13 @@ type PrometheusObserver struct {
 
 // PrometheusObserverConfig is the configuration for PrometheusObserver.
 type PrometheusObserverConfig struct {
+	// PodLister supplies cached live identity without adding API calls.
+	PodLister listersv1.PodLister
+	// VPALister and RecommenderName select immutable informer snapshots. Using
+	// both cached listers avoids reading the main loop's mutable model maps.
+	VPALister         vpa_lister.VerticalPodAutoscalerLister
+	RecommenderName   string
+	IgnoredNamespaces []string
 	// API is the Prometheus client. Reuse history.NewPrometheusAPI to share
 	// the same instrumentation as the history provider.
 	API prometheusv1.API
@@ -121,14 +139,18 @@ type PrometheusObserverConfig struct {
 // NewPrometheusObserver constructs a PrometheusObserver from cfg.
 func NewPrometheusObserver(cfg PrometheusObserverConfig) *PrometheusObserver {
 	return &PrometheusObserver{
-		promAPI:        cfg.API,
-		clusterState:   cfg.ClusterState,
-		oomChan:        cfg.OomChan,
-		pollInterval:   cfg.PollInterval,
-		queryTimeout:   cfg.QueryTimeout,
-		podLabel:       cfg.PodLabel,
-		containerLabel: cfg.ContainerLabel,
-		values:         make(map[model.VpaID]map[podCtrKey]float64),
+		promAPI:           cfg.API,
+		podLister:         cfg.PodLister,
+		vpaLister:         cfg.VPALister,
+		recommenderName:   cfg.RecommenderName,
+		ignoredNamespaces: cfg.IgnoredNamespaces,
+		clusterState:      cfg.ClusterState,
+		oomChan:           cfg.OomChan,
+		pollInterval:      cfg.PollInterval,
+		queryTimeout:      cfg.QueryTimeout,
+		podLabel:          cfg.PodLabel,
+		containerLabel:    cfg.ContainerLabel,
+		values:            make(map[model.VpaID]map[podCtrKey]float64),
 	}
 }
 
@@ -148,7 +170,10 @@ func (o *PrometheusObserver) Run(ctx context.Context) {
 }
 
 func (o *PrometheusObserver) pollOnce(ctx context.Context) {
-	vpas := o.clusterState.VPAs()
+	vpas := o.sourceVPAs()
+	if vpas == nil {
+		return
+	} // A lister failure must not reset counter baselines.
 	for _, vpa := range vpas {
 		selector := annotations.OOMCounterMetric(vpa.Annotations)
 		if selector == "" {
@@ -178,6 +203,7 @@ func (o *PrometheusObserver) pruneVPAs(current map[model.VpaID]*model.Vpa) {
 // `dotnet_oome{deployment="api"}`); we only wrap it with sum-by. We do NOT
 // additionally filter by VPA pod selector — the user's matchers own scoping.
 func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, selector string) {
+	generation := vpa.Generation
 	queryCtx, cancel := context.WithTimeout(ctx, o.queryTimeout)
 	defer cancel()
 
@@ -211,7 +237,10 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 	}
 	metrics_recommender.RecordPrometheusObserverPoll(vpa.ID.Namespace, vpa.ID.VpaName, metrics_recommender.PollOK)
 
-	pods := o.clusterState.Pods()
+	var pods map[model.PodID]*model.PodState
+	if o.podLister == nil {
+		pods = o.clusterState.Pods()
+	}
 
 	o.mu.Lock()
 	vpaState, ok := o.values[vpa.ID]
@@ -233,7 +262,18 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 			continue
 		}
 
-		key := podCtrKey{pod: podName, container: ctrName}
+		var uid types.UID
+		var liveMemory model.ResourceAmount
+		if o.podLister != nil {
+			pod, err := o.podLister.Pods(vpa.ID.Namespace).Get(podName)
+			if err != nil || pod.UID == "" {
+				continue
+			}
+			uid = pod.UID
+			requests, _ := resourcehelpers.ContainerRequestsAndLimits(ctrName, pod)
+			liveMemory = model.ResourceAmount(requests.Memory().Value())
+		}
+		key := podCtrKey{vpaUID: vpa.UID, pod: podName, container: ctrName, uid: uid, metric: selector}
 
 		o.mu.Lock()
 		previous, hadPrevious := vpaState[key]
@@ -266,15 +306,18 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 		}
 
 		podID := model.PodID{Namespace: vpa.ID.Namespace, PodName: podName}
-		podState, ok := pods[podID]
-		if !ok {
-			continue
+		memory := liveMemory
+		if o.podLister == nil {
+			podState, ok := pods[podID]
+			if !ok {
+				continue
+			}
+			container, ok := podState.Containers[ctrName]
+			if !ok {
+				continue
+			}
+			memory = container.Request[model.ResourceMemory]
 		}
-		container, ok := podState.Containers[ctrName]
-		if !ok {
-			continue
-		}
-		memory := container.Request[model.ResourceMemory]
 		if memory == 0 {
 			klog.V(4).InfoS("Prometheus OOM observer: skipping container with no memory request", "vpa", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName), "pod", podName, "container", ctrName)
 			continue
@@ -283,8 +326,13 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 		ts := sample.Timestamp.Time().UTC()
 		for range count {
 			o.oomChan <- OomInfo{
-				Timestamp: ts,
-				Memory:    memory,
+				VpaUID:        vpa.UID,
+				VpaID:         vpa.ID,
+				VpaGeneration: generation,
+				Metric:        selector,
+				PodUID:        uid,
+				Timestamp:     ts,
+				Memory:        memory,
 				ContainerID: model.ContainerID{
 					PodID:         podID,
 					ContainerName: ctrName,
@@ -305,8 +353,17 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 	// silently lose events on the next successful query.
 	o.mu.Lock()
 	for key := range vpaState {
+		if key.metric != selector || key.vpaUID != vpa.UID {
+			delete(vpaState, key)
+			continue
+		}
 		podID := model.PodID{Namespace: vpa.ID.Namespace, PodName: key.pod}
-		if _, ok := pods[podID]; !ok {
+		if o.podLister != nil {
+			pod, err := o.podLister.Pods(vpa.ID.Namespace).Get(key.pod)
+			if err != nil || pod.UID != key.uid {
+				delete(vpaState, key)
+			}
+		} else if _, ok := pods[podID]; !ok {
 			delete(vpaState, key)
 		}
 	}

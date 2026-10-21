@@ -5,6 +5,7 @@ on:
     paths:
       - 'vertical-pod-autoscaler/**'
       - '!vertical-pod-autoscaler/**/*.md'
+      - '.github/workflows/vpa-benchmark.yaml'
 
 permissions:
   contents: read
@@ -18,13 +19,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: pr
+          ref: ${{ github.event.pull_request.head.sha }}
           # Not needed: this job only reads the repo and never pushes.
           persist-credentials: false
 
       - name: Checkout Base
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: ${{ github.event.pull_request.base.sha }}
           path: base
           # Not needed: this job only reads the repo and never pushes.
           persist-credentials: false
@@ -35,17 +37,31 @@ jobs:
           go-version-file: pr/vertical-pod-autoscaler/go.mod
           cache-dependency-path: pr/vertical-pod-autoscaler/go.sum
 
-      - name: Run Benchmark (Base branch)
+      - name: Run Benchmarks
         shell: bash
         run: |
-          cd base/vertical-pod-autoscaler
-          go test -run='^$' -bench=. -count=10 ./... | tee ../../base.txt
+          # Compile both revisions before sampling. Otherwise the first measured
+          # revision also warms the runner and the shared build/module caches.
+          for revision in base pr; do
+            (cd "$revision/vertical-pod-autoscaler" && go test -run='^$' ./...)
+          done
 
-      - name: Run Benchmark (PR branch)
-        shell: bash
-        run: |
-          cd pr/vertical-pod-autoscaler
-          go test -run='^$' -bench=. -count=10 ./... | tee ../../pr.txt
+          : > base.txt
+          : > pr.txt
+          # Keep ten samples per revision, but alternate AB/BA pairs rather than
+          # measuring all of base before all of PR. This balances runner drift
+          # across both revisions without changing the regression threshold.
+          for sample in {1..10}; do
+            if (( sample % 2 )); then
+              revisions=(base pr)
+            else
+              revisions=(pr base)
+            fi
+            for revision in "${revisions[@]}"; do
+              echo "Benchmark sample $sample: $revision"
+              (cd "$revision/vertical-pod-autoscaler" && go test -run='^$' -bench=. -count=1 ./...) | tee -a "$revision.txt"
+            done
+          done
 
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260813145340-fd4a688df892
@@ -53,18 +69,27 @@ jobs:
       - name: Compare Results
         shell: bash
         run: |
-          echo "### Vertical Pod Autoscaler Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "Comparing PR branch against \`"$GITHUB_BASE_REF"\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
+          printf '### Vertical Pod Autoscaler Benchmark Results\nComparing PR branch against %s\n\n' "$GITHUB_BASE_REF" >> "$GITHUB_STEP_SUMMARY"
+
           if [ -s base.txt ] && [ -s pr.txt ]; then
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            $(go env GOPATH)/bin/benchstat base.txt pr.txt | tee benchstat.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            "$(go env GOPATH)/bin/benchstat" base.txt pr.txt | tee benchstat.txt | tee -a "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+
             # Fail if any regression is >= 10%
             grep -qE '\+[1-9][0-9].*%' benchstat.txt && { echo "Regression detected >= 10%"; exit 1; } || true
           else
-            echo "Error: Benchmark results not found or empty." >> $GITHUB_STEP_SUMMARY
+            echo "Error: Benchmark results not found or empty." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vpa-benchmark-results
+          path: |
+            base.txt
+            pr.txt
+            benchstat.txt
+          if-no-files-found: warn

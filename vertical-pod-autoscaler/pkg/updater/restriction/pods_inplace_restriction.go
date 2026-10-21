@@ -250,6 +250,10 @@ func (ip *PodsInPlaceRestrictionImpl) InPlaceUpdate(podToUpdate *corev1.Pod, vpa
 		return errors.New("no resource patches were calculated to apply")
 	}
 
+	resizePatches, err := protectExternalOOMResize(podToUpdate, vpa, resizePatches)
+	if err != nil {
+		return err
+	}
 	patch, err := json.Marshal(resizePatches)
 	if err != nil {
 		return err
