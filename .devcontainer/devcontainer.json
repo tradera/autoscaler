@@ -1,6 +1,6 @@
 {
   "name": "Kubernetes Autoscaler Development",
-  "image": "mcr.microsoft.com/devcontainers/go:1.26",
+  "image": "mcr.microsoft.com/devcontainers/go:1.27",
 
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {
@@ -15,7 +15,7 @@
 
   "onCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends libseccomp-dev",
 
-  "postCreateCommand": "cd cluster-autoscaler && go mod download && cd .. && cd vertical-pod-autoscaler && go mod download && cd .. && hack/install-verify-tools.sh && go install sigs.k8s.io/kind@latest",
+  "postCreateCommand": "cd cluster-autoscaler && go mod download && cd .. && cd vertical-pod-autoscaler && go mod download && cd .. && hack/install-verify-tools.sh && go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(cat vertical-pod-autoscaler/.golangci-lint-version) && go install sigs.k8s.io/kind@latest",
 
   "customizations": {
     "vscode": {
