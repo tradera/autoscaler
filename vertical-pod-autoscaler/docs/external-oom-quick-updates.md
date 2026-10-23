@@ -16,7 +16,7 @@ The fork can use an application OOM counter to accelerate an in-place memory inc
 - Keep the installed upstream VPA APIs and CRDs unchanged. Run the fork's recommender and updater with external-OOM Event support.
 - Use `InPlace` or `InPlaceOrRecreate` with the corresponding Kubernetes support and VPA feature gates enabled.
 - Configure the existing `external.vpa.k8s.io/oom-counter-metric` VPA annotation with a Prometheus counter selector. Its pod/container labels must match the observer configuration, and its series must be scoped to the VPA's target pods.
-- Allow the observer to establish a baseline. Its first observation does not synthesize historical OOM events.
+- Allow the observer to establish a baseline. Series in its first successful poll of a VPA are baselines and do not synthesize historical OOM events. A series that appears after that poll counts from zero, so a runtime that creates the series at its first OOM, such as .NET, has that OOM counted. A pod that replaces a tracked pod of the same name starts from a new baseline.
 - Permit the recommender to create/patch Events and the updater to list Events in its configured namespace scope. The checked-in component roles already include these permissions. No VPA metadata-write permission is needed.
 
 ## Event contract

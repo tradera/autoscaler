@@ -25,6 +25,7 @@ import (
 	prometheusv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	prommodel "github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/model"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
@@ -103,6 +104,7 @@ func newTestObserver(api promQueryAPI, cs clusterStateView, ch chan<- OomInfo) *
 		podLabel:       "pod",
 		containerLabel: "container",
 		values:         make(map[model.VpaID]map[podCtrKey]float64),
+		primed:         make(map[model.VpaID]counterSource),
 	}
 }
 
@@ -262,9 +264,7 @@ func TestPrometheusObserver_PreservesStateAcrossEmptyQueryResults(t *testing.T) 
 	assert.Len(t, ch, 3, "state must survive empty queries; delta = 7 - 4 = 3")
 }
 
-func TestPrometheusObserver_PerPodBaseline(t *testing.T) {
-	// Each pod's first observation is its own baseline. Pods appearing
-	// later don't get retroactive events when they first show up.
+func TestPrometheusObserver_SeriesAppearingAfterFirstPollCountFromZero(t *testing.T) {
 	vpa := vpaWithOOMAnnotation("ns", "vpa1", "m")
 	podA := podWithMemRequest("ns", "pod-a", "ctr", 1<<20)
 	podB := podWithMemRequest("ns", "pod-b", "ctr", 1<<20)
@@ -274,35 +274,128 @@ func TestPrometheusObserver_PerPodBaseline(t *testing.T) {
 	}
 	now := time.Now()
 	api := &fakeAPI{results: []prommodel.Value{
-		// First poll: only pod-a present.
 		prommodel.Vector{sample("pod-a", "ctr", 5, now)},
-		// Second poll: pod-a grew by 2, pod-b appears for first time.
 		prommodel.Vector{
 			sample("pod-a", "ctr", 7, now),
-			sample("pod-b", "ctr", 11, now),
+			sample("pod-b", "ctr", 1, now),
 		},
-		// Third poll: pod-a grew by 1, pod-b grew by 4.
 		prommodel.Vector{
 			sample("pod-a", "ctr", 8, now),
-			sample("pod-b", "ctr", 15, now),
+			sample("pod-b", "ctr", 4, now),
 		},
 	}}
 	ch := make(chan OomInfo, 32)
 	o := newTestObserver(api, cs, ch)
 
 	o.pollOnce(context.Background())
-	assert.Empty(t, ch, "pod-a first observation = baseline")
+	assert.Empty(t, ch, "pod-a in the first poll is a baseline")
 
 	o.pollOnce(context.Background())
-	assert.Len(t, ch, 2, "pod-a delta 5->7 = 2 events; pod-b first observation = baseline")
-
-	// Drain pod-a's events.
-	for range 2 {
+	require.Len(t, ch, 3, "pod-a 5->7 = 2; pod-b appears at 1 after the first poll = 1")
+	for range 3 {
 		<-ch
 	}
 
 	o.pollOnce(context.Background())
-	assert.Len(t, ch, 5, "pod-a delta 7->8 = 1; pod-b delta 11->15 = 4")
+	assert.Len(t, ch, 4, "pod-a 7->8 = 1; pod-b 1->4 = 3")
+}
+
+func TestPrometheusObserver_FirstOOMAfterEmptyFirstPollIsCounted(t *testing.T) {
+	// .NET creates the exception counter series at the first OOM, so a
+	// healthy pod has no series until then.
+	vpa := vpaWithOOMAnnotation("ns", "vpa1", "m")
+	pod := podWithMemRequest("ns", "pod-a", "ctr", 1<<20)
+	cs := &fakeClusterState{
+		vpas: map[model.VpaID]*model.Vpa{vpa.ID: vpa},
+		pods: map[model.PodID]*model.PodState{pod.ID: pod},
+	}
+	api := &fakeAPI{results: []prommodel.Value{
+		prommodel.Vector{},
+		prommodel.Vector{sample("pod-a", "ctr", 1, time.Now())},
+	}}
+	ch := make(chan OomInfo, 4)
+	o := newTestObserver(api, cs, ch)
+
+	o.pollOnce(context.Background())
+	o.pollOnce(context.Background())
+
+	assert.Len(t, ch, 1, "the first OOM creates the series at 1 and must be emitted")
+}
+
+func TestPrometheusObserver_SecondContainerFirstOOMIsCounted(t *testing.T) {
+	vpa := vpaWithOOMAnnotation("ns", "vpa1", "m")
+	pod := podWithMemRequest("ns", "pod-a", "app", 1<<20)
+	pod.Containers["sidecar"] = &model.ContainerState{Request: model.Resources{model.ResourceMemory: 1 << 20}}
+	cs := &fakeClusterState{
+		vpas: map[model.VpaID]*model.Vpa{vpa.ID: vpa},
+		pods: map[model.PodID]*model.PodState{pod.ID: pod},
+	}
+	now := time.Now()
+	api := &fakeAPI{results: []prommodel.Value{
+		prommodel.Vector{sample("pod-a", "app", 2, now)},
+		prommodel.Vector{
+			sample("pod-a", "app", 2, now),
+			sample("pod-a", "sidecar", 1, now),
+		},
+	}}
+	ch := make(chan OomInfo, 4)
+	o := newTestObserver(api, cs, ch)
+
+	o.pollOnce(context.Background())
+	o.pollOnce(context.Background())
+
+	require.Len(t, ch, 1, "a tracked container must not turn another container's first OOM into a baseline")
+	assert.Equal(t, "sidecar", (<-ch).ContainerID.ContainerName)
+}
+
+func TestPrometheusObserver_FailedFirstPollKeepsBaseline(t *testing.T) {
+	vpa := vpaWithOOMAnnotation("ns", "vpa1", "m")
+	pod := podWithMemRequest("ns", "pod-a", "ctr", 1<<20)
+	cs := &fakeClusterState{
+		vpas: map[model.VpaID]*model.Vpa{vpa.ID: vpa},
+		pods: map[model.PodID]*model.PodState{pod.ID: pod},
+	}
+	api := &fakeAPI{err: errors.New("prometheus unavailable")}
+	ch := make(chan OomInfo, 8)
+	o := newTestObserver(api, cs, ch)
+
+	o.pollOnce(context.Background())
+
+	api.err = nil
+	api.results = []prommodel.Value{
+		prommodel.Vector{sample("pod-a", "ctr", 3, time.Now())},
+		prommodel.Vector{sample("pod-a", "ctr", 4, time.Now())},
+	}
+	o.pollOnce(context.Background())
+	assert.Empty(t, ch, "the first successful poll is a baseline, even after a failed one")
+
+	o.pollOnce(context.Background())
+	assert.Len(t, ch, 1, "3->4 = 1")
+}
+
+func TestPrometheusObserver_SelectorChangeEstablishesNewBaseline(t *testing.T) {
+	vpa := vpaWithOOMAnnotation("ns", "vpa1", "old_metric")
+	pod := podWithMemRequest("ns", "pod-a", "ctr", 1<<20)
+	cs := &fakeClusterState{
+		vpas: map[model.VpaID]*model.Vpa{vpa.ID: vpa},
+		pods: map[model.PodID]*model.PodState{pod.ID: pod},
+	}
+	api := &fakeAPI{results: []prommodel.Value{
+		prommodel.Vector{sample("pod-a", "ctr", 2, time.Now())},
+		prommodel.Vector{sample("pod-a", "ctr", 9, time.Now())},
+		prommodel.Vector{sample("pod-a", "ctr", 10, time.Now())},
+	}}
+	ch := make(chan OomInfo, 16)
+	o := newTestObserver(api, cs, ch)
+
+	o.pollOnce(context.Background())
+	vpa.Annotations[annotations.OOMCounterMetricAnnotation] = "new_metric"
+
+	o.pollOnce(context.Background())
+	assert.Empty(t, ch, "the new selector's first poll is a baseline")
+
+	o.pollOnce(context.Background())
+	assert.Len(t, ch, 1, "9->10 = 1")
 }
 
 func TestPrometheusObserver_SkipsUnannotatedVPAs(t *testing.T) {
