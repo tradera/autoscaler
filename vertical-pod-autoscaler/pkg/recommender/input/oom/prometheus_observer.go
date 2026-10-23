@@ -51,6 +51,12 @@ type clusterStateView interface {
 	Pods() map[model.PodID]*model.PodState
 }
 
+// counterSource identifies the VPA object and selector a counter state belongs to.
+type counterSource struct {
+	vpaUID types.UID
+	metric string
+}
+
 // podCtrKey is the per-(pod, container) key for tracked counter values.
 type podCtrKey struct {
 	vpaUID    types.UID
@@ -96,11 +102,16 @@ type PrometheusObserver struct {
 	containerLabel    string
 
 	// values holds the most recent counter value observed for each
-	// (VPA, pod, container). The first observation of a pod establishes
-	// a baseline (no events emitted); subsequent observations emit
-	// floor(current - previous) events.
+	// (VPA, pod, container); each observation emits floor(current - previous)
+	// events. Series in a VPA's first successful poll are baselines, because
+	// their counts may predate the observer. A series appearing after that
+	// starts from zero: runtimes such as .NET create the series at the first
+	// OOM, so treating it as a baseline would lose that OOM. A pod that
+	// replaces a tracked pod of the same name is a baseline again, since the
+	// series can still carry the old process's count.
 	mu     sync.Mutex
 	values map[model.VpaID]map[podCtrKey]float64
+	primed map[model.VpaID]counterSource
 }
 
 // PrometheusObserverConfig is the configuration for PrometheusObserver.
@@ -151,6 +162,7 @@ func NewPrometheusObserver(cfg PrometheusObserverConfig) *PrometheusObserver {
 		podLabel:          cfg.PodLabel,
 		containerLabel:    cfg.ContainerLabel,
 		values:            make(map[model.VpaID]map[podCtrKey]float64),
+		primed:            make(map[model.VpaID]counterSource),
 	}
 }
 
@@ -193,6 +205,7 @@ func (o *PrometheusObserver) pruneVPAs(current map[model.VpaID]*model.Vpa) {
 	for id := range o.values {
 		if _, ok := current[id]; !ok {
 			delete(o.values, id)
+			delete(o.primed, id)
 			metrics_recommender.DeletePrometheusObserverSeries(id.Namespace, id.VpaName)
 		}
 	}
@@ -242,11 +255,17 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 		pods = o.clusterState.Pods()
 	}
 
+	source := counterSource{vpaUID: vpa.UID, metric: selector}
 	o.mu.Lock()
 	vpaState, ok := o.values[vpa.ID]
 	if !ok {
 		vpaState = make(map[podCtrKey]float64)
 		o.values[vpa.ID] = vpaState
+	}
+	primed := o.primed[vpa.ID] == source
+	trackedPodUIDs := make(map[string]types.UID, len(vpaState))
+	for key := range vpaState {
+		trackedPodUIDs[key.pod] = key.uid
 	}
 	o.mu.Unlock()
 
@@ -280,7 +299,9 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 		vpaState[key] = current
 		o.mu.Unlock()
 
-		if !hadPrevious {
+		trackedUID, replacesTrackedPod := trackedPodUIDs[podName]
+		replacesTrackedPod = replacesTrackedPod && trackedUID != uid
+		if !hadPrevious && (!primed || replacesTrackedPod) {
 			klog.V(4).InfoS("Prometheus OOM observer: storing baseline", "vpa", klog.KRef(vpa.ID.Namespace, vpa.ID.VpaName), "pod", podName, "container", ctrName, "value", current)
 			continue
 		}
@@ -368,6 +389,7 @@ func (o *PrometheusObserver) pollVPA(ctx context.Context, vpa *model.Vpa, select
 		}
 	}
 	tracked := len(vpaState)
+	o.primed[vpa.ID] = source
 	o.mu.Unlock()
 	metrics_recommender.SetPrometheusObserverTrackedPods(vpa.ID.Namespace, vpa.ID.VpaName, tracked)
 }
